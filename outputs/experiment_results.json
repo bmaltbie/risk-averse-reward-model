@@ -1,0 +1,7 @@
+{
+  "num_training_situations": 350,
+  "num_test_situations": 150,
+  "final_accuracy": 0.5,
+  "model_name": "Qwen/Qwen2.5-0.5B",
+  "timestamp": "2025-10-28T23:43:43.905751"
+}
