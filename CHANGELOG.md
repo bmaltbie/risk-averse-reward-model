@@ -94,6 +94,23 @@ After mixed training, we expect:
 - **Reasoning**: After `train_test_split`, DataFrame indices are non-sequential (e.g., [1, 3, 4] instead of [0, 1, 2]). Using these indices with `iloc[]` causes IndexError. Resetting to 0-based sequential indices fixes the mismatch.
 - **Changed**: Loop from `for idx, row in dataframe.iterrows()` to `for idx in range(len(self.data))`
 
+### Hotfix: Mixed Mode Batches in DataLoader
+- **Error**: `ValueError: Batch contains mixed modes: ['pairwise', 'single', 'single', 'pairwise']`
+- **Root Cause**: HuggingFace Trainer's DataLoader randomly samples examples without respecting mode grouping. Since `MixedTrainingDataset` creates a flat list of interleaved pairwise and single-input examples, random sampling created batches mixing both modes. But `MixedDataCollator` and the model require homogeneous batches (all pairwise OR all single-input).
+- **Solution**: Created custom `ModeGroupedBatchSampler` and `MixedTrainingTrainer`
+  - `ModeGroupedBatchSampler`: Groups dataset indices by mode, creates homogeneous batches within each group, then shuffles batch order (not indices within batches)
+  - `MixedTrainingTrainer`: Custom Trainer that overrides **both** `get_train_dataloader()` and `get_eval_dataloader()` to use the mode-grouped sampler
+- **Technical Details**:
+  - Sampler splits dataset into pairwise_indices and single_indices lists
+  - Creates separate batches for each mode (respecting batch_size and drop_last)
+  - Shuffles batch order for randomness while maintaining within-batch homogeneity
+  - Trainer uses `batch_sampler` instead of standard sampler for DataLoader
+  - **Critical**: Both training AND evaluation dataloaders need mode-grouped sampling (error occurred during eval steps)
+- **Files Modified**:
+  - Cell 8: Added `ModeGroupedBatchSampler` class with mode grouping logic
+  - Cell 16: Added `MixedTrainingTrainer` class with both dataloader overrides, updated `train_reward_model()` to use it
+- **Why This Works**: The sampler ensures DataLoader yields only homogeneous batches for both training and evaluation, eliminating the mixed-mode error while maintaining training randomness through batch-level shuffling.
+
 ## [2.3.0] - Colab T4 GPU Compatibility Fixes - 2025-11-04
 
 ### Added
