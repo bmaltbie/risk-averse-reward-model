@@ -1,7 +1,7 @@
 """
 Risk-Averse Reward Model Training Experiment
 
-This experiment trains a reward model to be risk-averse using Qwen 1B model.
+This experiment trains a reward model to be risk-averse using TinyLlama 1.1B model.
 Uses data from strict_disagreements_10k_with_prompts_and_bad_formats.csv
 Compatible with both local execution and Google Colab.
 """
@@ -80,9 +80,23 @@ class RiskAversionDataLoader:
             )
         
         # Group by situation_id to get unique situations
+        # Each row in CSV represents an option, we need to aggregate per situation
         situations = []
         for situation_id, group in df.groupby('situation_id'):
-            # Take the first row for each situation (they should have the same prompt_text, correct_label, incorrect_label)
+            # Verify all rows in group have same prompt_text, correct_label, incorrect_label
+            # (since these should be situation-level properties, not option-level)
+            unique_prompts = group['prompt_text'].nunique()
+            unique_correct = group['correct_label'].nunique() 
+            unique_incorrect = group['incorrect_label'].nunique()
+            
+            if unique_prompts > 1:
+                print(f"Warning: situation_id {situation_id} has {unique_prompts} different prompts, using first")
+            if unique_correct > 1:
+                print(f"Warning: situation_id {situation_id} has {unique_correct} different correct_labels, using first")
+            if unique_incorrect > 1:
+                print(f"Warning: situation_id {situation_id} has {unique_incorrect} different incorrect_labels, using first")
+            
+            # Take the first row for situation-level properties
             first_row = group.iloc[0]
             
             # Process the prompt text - replace thinking instruction with output-only instruction
@@ -92,31 +106,50 @@ class RiskAversionDataLoader:
                     'You can think about which you\'d choose and then output your answer.',
                     'Output the label of your chosen option only.'
                 )
-            elif 'You can think about which you\'d choose' in prompt_text:
-                prompt_text = prompt_text.replace(
-                    'You can think about which you\'d choose and then output your answer.',
-                    'Output the label of your chosen option only.'
-                )
+            
+            # Collect all bad answer variations from all rows in the group
+            bad_correct_list = []
+            bad_incorrect_list = []
+            
+            for _, row in group.iterrows():
+                bad_correct = row.get('bad_correct_answers', '')
+                bad_incorrect = row.get('bad_incorrect_answers', '')
+                
+                if pd.notna(bad_correct) and bad_correct.strip():
+                    bad_correct_list.extend([x.strip() for x in str(bad_correct).split(',') if x.strip()])
+                if pd.notna(bad_incorrect) and bad_incorrect.strip():
+                    bad_incorrect_list.extend([x.strip() for x in str(bad_incorrect).split(',') if x.strip()])
+            
+            # Remove duplicates and join back
+            bad_correct_combined = ','.join(list(set(bad_correct_list))) if bad_correct_list else ''
+            bad_incorrect_combined = ','.join(list(set(bad_incorrect_list))) if bad_incorrect_list else ''
             
             situations.append({
                 'situation_id': situation_id,
                 'prompt_text': prompt_text,
                 'correct_label': first_row['correct_label'],
                 'incorrect_label': first_row['incorrect_label'],
-                # Include bad versions if they exist
-                'bad_correct_answers': first_row.get('bad_correct_answers', ''),
-                'bad_incorrect_answers': first_row.get('bad_incorrect_answers', '')
+                'bad_correct_answers': bad_correct_combined,
+                'bad_incorrect_answers': bad_incorrect_combined,
+                'num_options': len(group)  # Track how many options were in this situation
             })
         
         result_df = pd.DataFrame(situations)
-        print(f"Processed into {len(result_df)} unique situations")
+        total_options = df.groupby('situation_id').size().sum()
+        print(f"Processed {total_options} option rows into {len(result_df)} unique situations")
         
         # Display sample data
         if len(result_df) > 0:
+            sample = result_df.iloc[0]
             print(f"\nSample situation:")
-            print(f"Prompt: {result_df.iloc[0]['prompt_text'][:200]}...")
-            print(f"Risk-averse choice: {result_df.iloc[0]['correct_label']}")
-            print(f"Risk-neutral choice: {result_df.iloc[0]['incorrect_label']}")
+            print(f"Prompt: {sample['prompt_text'][:200]}...")
+            print(f"Risk-averse choice: {sample['correct_label']}")
+            print(f"Risk-neutral choice: {sample['incorrect_label']}")
+            print(f"Options in situation: {sample['num_options']}")
+            if sample['bad_correct_answers']:
+                print(f"Bad correct variations: {sample['bad_correct_answers']}")
+            if sample['bad_incorrect_answers']:
+                print(f"Bad incorrect variations: {sample['bad_incorrect_answers']}")
         
         return result_df
 
@@ -124,7 +157,7 @@ class RiskAversionDataLoader:
 class RiskAversionDataset(Dataset):
     """Dataset for risk aversion reward model training"""
     
-    def __init__(self, dataframe: pd.DataFrame, tokenizer, max_length=128):  # Reduced from 512 to 128
+    def __init__(self, dataframe: pd.DataFrame, tokenizer, max_length=256):
         self.data = dataframe
         self.tokenizer = tokenizer
         self.max_length = max_length
@@ -161,7 +194,7 @@ class RiskAversionDataset(Dataset):
 class PairwiseRiskAversionDataset(Dataset):
     """Dataset that provides pairs of risk-averse vs risk-neutral choices for ranking loss"""
     
-    def __init__(self, dataframe: pd.DataFrame, tokenizer, max_length=128):
+    def __init__(self, dataframe: pd.DataFrame, tokenizer, max_length=256):
         self.data = dataframe
         self.tokenizer = tokenizer
         self.max_length = max_length
@@ -205,18 +238,19 @@ class PairwiseRiskAversionDataset(Dataset):
 class RiskAverseRewardModel(nn.Module):
     """Reward model for scoring risk-averse behavior with pairwise ranking loss"""
     
-    def __init__(self, model_name="Qwen/Qwen2.5-0.5B"):
+    def __init__(self, model_name="TinyLlama/TinyLlama-1.1B-Chat-v1.0"):
         super().__init__()
-        # Disable device_map="auto" on MPS due to compatibility issues
+        # Optimized for CUDA (Colab) with automatic device mapping and fp16
         load_kwargs = {
             "num_labels": 1,
-            "dtype": torch.float16 if torch.cuda.is_available() else torch.float32,
-            "low_cpu_mem_usage": True
+            "dtype": torch.float16,  # Always use fp16 for memory efficiency
+            "device_map": "auto",  # Automatic GPU device mapping
+            "low_cpu_mem_usage": True,
+            "attn_implementation": "flash_attention_2" if torch.cuda.is_available() else None,  # Use Flash Attention if available
         }
         
-        # Only use device_map on CUDA, not MPS
-        if torch.cuda.is_available():
-            load_kwargs["device_map"] = "auto"
+        # Remove None values
+        load_kwargs = {k: v for k, v in load_kwargs.items() if v is not None}
             
         self.backbone = AutoModelForSequenceClassification.from_pretrained(
             model_name,
@@ -247,7 +281,7 @@ class RiskAverseRewardModel(nn.Module):
         logits = outputs.logits.squeeze(-1)
         
         if labels is not None:
-            # Use BCE loss for backward compatibility during evaluation
+            # Use BCE loss for evaluation mode
             loss_fn = nn.BCEWithLogitsLoss()
             loss = loss_fn(logits, labels)
             return {"loss": loss, "logits": logits}
@@ -353,7 +387,7 @@ class PairwiseDataCollator:
         
         return batch
 
-def train_reward_model(dataset_df: pd.DataFrame, model_name="Qwen/Qwen2.5-0.5B"):
+def train_reward_model(dataset_df: pd.DataFrame, model_name="TinyLlama/TinyLlama-1.1B-Chat-v1.0"):
     """Train the risk-averse reward model with pairwise ranking loss"""
     print(f"Training reward model with {len(dataset_df)} situations using pairwise ranking loss...")
     
@@ -364,17 +398,14 @@ def train_reward_model(dataset_df: pd.DataFrame, model_name="Qwen/Qwen2.5-0.5B")
     
     model = RiskAverseRewardModel(model_name)
     
-    # For MPS compatibility, explicitly move model to CPU if MPS is detected
-    if torch.backends.mps.is_available() and not torch.cuda.is_available():
-        print("MPS detected but using CPU for better compatibility with pairwise training")
-        model = model.cpu()
+    # Model will be automatically placed on GPU via device_map="auto"
     
     # Split data
     train_df, val_df = train_test_split(dataset_df, test_size=0.2, random_state=42)
     
-    # Create pairwise datasets
-    train_dataset = PairwiseRiskAversionDataset(train_df, tokenizer, max_length=128)
-    val_dataset = PairwiseRiskAversionDataset(val_df, tokenizer, max_length=128)
+    # Create pairwise datasets with increased sequence length for larger model
+    train_dataset = PairwiseRiskAversionDataset(train_df, tokenizer, max_length=256)
+    val_dataset = PairwiseRiskAversionDataset(val_df, tokenizer, max_length=256)
     
     print(f"Training on {len(train_dataset)} situation pairs")
     print(f"Validation on {len(val_dataset)} situation pairs")
@@ -383,9 +414,9 @@ def train_reward_model(dataset_df: pd.DataFrame, model_name="Qwen/Qwen2.5-0.5B")
     training_args = TrainingArguments(
         output_dir="./risk_averse_model",
         num_train_epochs=3,
-        per_device_train_batch_size=1,        # Reduced from 4 to 1 (now each batch contains 2 inputs per situation)
-        per_device_eval_batch_size=1,         # Reduced from 4 to 1
-        gradient_accumulation_steps=4,        # Maintain effective batch size of 4
+        per_device_train_batch_size=2,        # Increased batch size for GPU efficiency
+        per_device_eval_batch_size=4,         # Larger eval batch for faster evaluation  
+        gradient_accumulation_steps=2,        # Maintain effective batch size of 4
         warmup_steps=100,
         weight_decay=0.01,
         logging_dir="./logs",
@@ -394,8 +425,13 @@ def train_reward_model(dataset_df: pd.DataFrame, model_name="Qwen/Qwen2.5-0.5B")
         eval_steps=200,
         save_steps=200,                      # Must be multiple of eval_steps for load_best_model_at_end
         load_best_model_at_end=False,        # Disable for pairwise training (no eval_loss available)
-        fp16=torch.cuda.is_available(),      # Only enable fp16 on CUDA, not MPS
-        dataloader_pin_memory=False,         # Reduce memory transfer overhead
+        fp16=True,                          # Always use fp16 for memory efficiency in Colab
+        dataloader_pin_memory=True,          # Enable memory pinning for faster GPU transfer
+        dataloader_num_workers=2,           # Use multiple workers for data loading
+        remove_unused_columns=False,        # Keep all columns for custom collator
+        optim="adamw_torch_fused",          # Use fused AdamW for better GPU utilization
+        group_by_length=True,               # Group sequences by length for efficiency
+        prediction_loss_only=True,         # Only compute loss (not other metrics)
     )
     
     # Custom data collator for pairwise data
@@ -431,14 +467,31 @@ def train_reward_model(dataset_df: pd.DataFrame, model_name="Qwen/Qwen2.5-0.5B")
     
     return model, tokenizer, trainer
 
+def check_answer_match(model_output: str, correct_answer: str, bad_variations: str) -> bool:
+    """Check if model output matches correct answer or any of its bad variations"""
+    model_output = model_output.strip()
+    
+    # Check exact match with correct answer
+    if model_output == correct_answer:
+        return True
+    
+    # Check bad variations if they exist
+    if bad_variations and pd.notna(bad_variations):
+        bad_list = [x.strip() for x in str(bad_variations).split(',') if x.strip()]
+        if model_output in bad_list:
+            return True
+    
+    return False
+
 def evaluate_model(model, tokenizer, test_df: pd.DataFrame, return_detailed=False):
-    """Evaluate the trained model"""
+    """Evaluate the trained model with support for bad answer variations"""
     print(f"Evaluating model on {len(test_df)} test situations...")
     
     model.eval()
     correct_predictions = 0
     total_predictions = 0
     risk_averse_wins = 0  # Count how often risk-averse option scores higher
+    bad_variation_matches = 0  # Count matches via bad variations
     
     # Store detailed results for plotting
     results = {
@@ -446,7 +499,12 @@ def evaluate_model(model, tokenizer, test_df: pd.DataFrame, return_detailed=Fals
         'risk_neutral_scores': [],
         'predictions': [],
         'expected': [],
-        'situation_ids': []
+        'situation_ids': [],
+        'answer_quality_stats': {
+            'exact_matches': 0,
+            'bad_variation_matches': 0,
+            'no_matches': 0
+        }
     }
     
     # Get the device the model is on
@@ -454,46 +512,74 @@ def evaluate_model(model, tokenizer, test_df: pd.DataFrame, return_detailed=Fals
     
     with torch.no_grad():
         for _, row in test_df.iterrows():
-            risk_averse_score = None
-            risk_neutral_score = None
+            risk_averse_scores = []  # All variations of risk-averse answer
+            risk_neutral_scores = []  # All variations of risk-neutral answer
             
             # Test both correct and incorrect options using single input mode
-            for label, is_correct in [("correct_label", True), ("incorrect_label", False)]:
+            for label, is_correct, bad_label in [
+                ("correct_label", True, "bad_correct_answers"), 
+                ("incorrect_label", False, "bad_incorrect_answers")
+            ]:
                 chosen_option = row[label]
-                input_text = f"{row['prompt_text']}\n\nChosen option: {chosen_option}"
+                bad_variations = row.get(bad_label, '')
                 
+                # Test main answer
+                input_text = f"{row['prompt_text']}\n\nChosen option: {chosen_option}"
                 encoding = tokenizer(
                     input_text,
                     truncation=True,
                     padding='max_length',
-                    max_length=128,
+                    max_length=256,
                     return_tensors='pt'
                 )
-                
-                # Move tensors to the same device as model
                 encoding = {k: v.to(device) for k, v in encoding.items()}
-                
-                # Use single input mode for evaluation
                 outputs = model(input_ids=encoding['input_ids'], 
                               attention_mask=encoding['attention_mask'])
+                main_score = outputs["logits"].item()
                 
-                # Get raw score (no sigmoid needed for ranking comparison)
-                raw_score = outputs["logits"].item()
+                # Test bad variations
+                variation_scores = []
+                if bad_variations and pd.notna(bad_variations):
+                    bad_list = [x.strip() for x in str(bad_variations).split(',') if x.strip()]
+                    for bad_answer in bad_list:
+                        if bad_answer and bad_answer != chosen_option:  # Avoid duplicates
+                            bad_input_text = f"{row['prompt_text']}\n\nChosen option: {bad_answer}"
+                            bad_encoding = tokenizer(
+                                bad_input_text,
+                                truncation=True,
+                                padding='max_length',
+                                max_length=256,
+                                return_tensors='pt'
+                            )
+                            bad_encoding = {k: v.to(device) for k, v in bad_encoding.items()}
+                            bad_outputs = model(input_ids=bad_encoding['input_ids'], 
+                                              attention_mask=bad_encoding['attention_mask'])
+                            variation_scores.append(bad_outputs["logits"].item())
+                
+                # Use the highest score among all variations (main + bad)
+                all_scores = [main_score] + variation_scores
+                best_score = max(all_scores)
                 
                 # Store scores for analysis
                 if is_correct:  # Risk-averse option
-                    risk_averse_score = raw_score
+                    risk_averse_scores = all_scores
+                    risk_averse_score = best_score
                 else:  # Risk-neutral option
-                    risk_neutral_score = raw_score
+                    risk_neutral_scores = all_scores
+                    risk_neutral_score = best_score
                 
-                # For accuracy calculation, still use sigmoid and threshold
-                prediction = torch.sigmoid(outputs["logits"]).item()
+                # For accuracy calculation, use best score
+                prediction = torch.sigmoid(torch.tensor(best_score)).item()
                 if (prediction > 0.5) == is_correct:
                     correct_predictions += 1
                 total_predictions += 1
                 
                 results['predictions'].append(prediction)
                 results['expected'].append(1.0 if is_correct else 0.0)
+                
+                # Track if bad variations helped
+                if len(variation_scores) > 0 and best_score in variation_scores:
+                    bad_variation_matches += 1
             
             # Check if risk-averse option scores higher (this is the key metric)
             if risk_averse_score > risk_neutral_score:
@@ -509,7 +595,13 @@ def evaluate_model(model, tokenizer, test_df: pd.DataFrame, return_detailed=Fals
     
     print(f"Model accuracy: {accuracy:.3f}")
     print(f"Risk-averse preference rate: {risk_averse_preference_rate:.3f}")
+    print(f"Bad variation matches: {bad_variation_matches}/{total_predictions} ({bad_variation_matches/total_predictions:.1%})")
     print(f"Average score difference (risk-averse - risk-neutral): {np.mean(np.array(results['risk_averse_scores']) - np.array(results['risk_neutral_scores'])):.3f}")
+    
+    # Store bad variation stats
+    results['answer_quality_stats']['bad_variation_matches'] = bad_variation_matches
+    results['answer_quality_stats']['exact_matches'] = total_predictions - bad_variation_matches
+    results['answer_quality_stats']['total_predictions'] = total_predictions
     
     if return_detailed:
         results['risk_averse_preference_rate'] = risk_averse_preference_rate
@@ -704,7 +796,7 @@ def run_experiment():
         "num_training_situations": len(train_df),
         "num_test_situations": len(test_df),
         "final_accuracy": accuracy,
-        "model_name": "Qwen/Qwen2.5-0.5B",
+        "model_name": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
         "timestamp": datetime.now().isoformat()
     }
     

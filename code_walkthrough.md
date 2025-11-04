@@ -2,6 +2,8 @@
 
 This document provides a detailed, step-by-step walkthrough of the `risk_averse_experiment.py` code, explaining the purpose and reasoning behind each major component.
 
+The current implementation uses pairwise ranking loss to train reward models that prefer risk-averse choices. For historical context and evolution of the codebase, see [CHANGELOG.md](CHANGELOG.md).
+
 ## Table of Contents
 1. [Imports and Setup](#imports-and-setup)
 2. [Environment Detection](#environment-detection)
@@ -144,38 +146,7 @@ for situation_id, group in df.groupby('situation_id'):
 
 ## Dataset Classes
 
-### Legacy RiskAversionDataset (Kept for Compatibility)
-
-```python
-class RiskAversionDataset(Dataset):
-    def __init__(self, dataframe: pd.DataFrame, tokenizer, max_length=128):
-        self.data = dataframe
-        self.tokenizer = tokenizer
-        self.max_length = max_length
-        
-    def __len__(self):
-        return len(self.data) * 2  # Each situation generates 2 examples
-```
-
-**Purpose**: PyTorch Dataset class that converts risk scenarios into training examples.
-
-**Key Design Decision - Double Examples**:
-```python
-def __getitem__(self, idx):
-    situation_idx = idx // 2
-    is_correct = (idx % 2) == 0
-    
-    row = self.data.iloc[situation_idx]
-    chosen_label = row["correct_label"] if is_correct else row["incorrect_label"]
-    input_text = f"{row['prompt_text']}\n\nChosen option: {chosen_label}"
-```
-
-**Reasoning**: 
-- **Binary Training**: Each situation creates 2 training examples - one for risk-averse choice (label=1) and one for risk-neutral choice (label=0)
-- **Balanced Dataset**: Ensures equal representation of positive and negative examples
-- **Indexing Logic**: `idx // 2` gets situation index, `idx % 2` determines if it's the correct (risk-averse) or incorrect (risk-neutral) example
-
-### New PairwiseRiskAversionDataset (Primary)
+### PairwiseRiskAversionDataset
 
 ```python
 class PairwiseRiskAversionDataset(Dataset):
@@ -211,8 +182,8 @@ class PairwiseRiskAversionDataset(Dataset):
 
 **Key Design Advantages**:
 - **Direct Comparison**: Each training example contains both options from the same scenario
-- **Efficient Training**: One example per situation (not 2 separate examples)
-- **Ranking Optimization**: Perfect for pairwise ranking loss training
+- **Efficient Training**: One example per situation
+- **Ranking Optimization**: Designed for pairwise ranking loss training
 - **Clear Structure**: Explicit separation of risk-averse vs risk-neutral inputs
 
 ### Custom Data Collator
@@ -320,7 +291,7 @@ def forward(self, input_ids, attention_mask, labels=None):
 
 **Reasoning**:
 - **Single Output**: `num_labels=1` and `squeeze(-1)` produces scalar reward scores
-- **BCE Loss**: Binary Cross-Entropy loss is appropriate for binary classification (risk-averse vs risk-neutral)
+- **BCE Loss**: Binary Cross-Entropy loss used for evaluation mode
 - **Conditional Loss**: Only computes loss during training, not inference
 
 ---
@@ -622,7 +593,7 @@ plot_results(trainer, eval_results, accuracy)
 
 **Flow Logic**:
 1. **70/30 Split**: Reserves larger portion for evaluation than validation (30% vs 20%)
-2. **Sequential Execution**: Each step builds on previous results
+2. **Sequential Execution**: Each step builds on results from the previous step
 3. **Comprehensive Output**: Combines training logs, evaluation metrics, and visualizations
 
 ### Results Saving
@@ -696,7 +667,7 @@ The code includes multiple layers of device compatibility:
 This code implements a complete pipeline for training a reward model to prefer risk-averse choices:
 
 1. **Data Loading**: Robust CSV processing with validation and prompt modification
-2. **Model Architecture**: Memory-optimized transformer with binary classification head
+2. **Model Architecture**: Memory-optimized transformer with reward scoring head
 3. **Training**: Efficient training with gradient accumulation and best model selection
 4. **Evaluation**: Comprehensive scoring of both option types per scenario
 5. **Visualization**: Rich plots showing training progress and model behavior
@@ -708,17 +679,17 @@ The design prioritizes memory efficiency, cross-platform compatibility, and thor
 
 ## Technical Architecture and Implementation Narrative
 
-The risk-averse reward model represents a carefully architected solution that evolved from traditional binary classification to sophisticated pairwise ranking optimization. At its core, the system addresses a fundamental challenge in AI alignment: training models to exhibit human-like risk preferences rather than maximizing expected value alone.
+The risk-averse reward model represents a carefully architected solution using pairwise ranking optimization. At its core, the system addresses a fundamental challenge in AI alignment: training models to exhibit human-like risk preferences rather than maximizing expected value alone.
 
-**Architectural Evolution and Design Philosophy**
+**Architectural Philosophy**
 
-The initial implementation followed conventional reward modeling approaches with binary cross-entropy loss, treating risk preference as a simple classification problem. However, this approach suffered from a critical flaw—the model could achieve high accuracy by learning spurious correlations such as position bias or option letter patterns, without actually developing risk-averse preferences. The breakthrough came through implementing pairwise ranking loss, which directly optimizes the core objective: ensuring risk-averse choices consistently score higher than risk-neutral alternatives.
+The implementation uses pairwise ranking loss to directly optimize the core objective: ensuring risk-averse choices consistently score higher than risk-neutral alternatives. This approach avoids spurious correlation learning by comparing options within the same scenario context.
 
-The RiskAverseRewardModel embodies this dual-mode philosophy through its flexible forward pass architecture. In pairwise training mode, it simultaneously processes both risk-averse and risk-neutral inputs from the same scenario, computing their respective scores and applying a hybrid loss function that combines margin ranking loss, sigmoid-based gradient flow, and L2 regularization. This multi-component loss design ensures robust optimization even when margin violations are sparse, while preventing score explosion through regularization. In single evaluation mode, the model maintains backward compatibility with existing evaluation workflows, enabling seamless integration with standard metrics.
+The RiskAverseRewardModel embodies this dual-mode philosophy through its flexible forward pass architecture. In pairwise training mode, it simultaneously processes both risk-averse and risk-neutral inputs from the same scenario, computing their respective scores and applying a hybrid loss function that combines margin ranking loss, sigmoid-based gradient flow, and L2 regularization. This multi-component loss design ensures robust optimization even when margin violations are sparse, while preventing score explosion through regularization. In single evaluation mode, the model supports individual option scoring for evaluation workflows, enabling standard metric computation.
 
 **Data Pipeline and Processing Strategy**
 
-The data architecture reflects careful consideration of both training efficiency and semantic correctness. The PairwiseRiskAversionDataset fundamentally restructures the training paradigm—instead of creating separate examples for each option, it presents complete scenario contexts with both choices explicitly tokenized. This approach eliminates artificial separation between related options and enables the model to learn genuine preference patterns rather than memorizing isolated choice-outcome mappings.
+The data architecture reflects careful consideration of both training efficiency and semantic correctness. The PairwiseRiskAversionDataset presents complete scenario contexts with both choices explicitly tokenized, enabling the model to learn genuine preference patterns within scenario contexts.
 
 The custom PairwiseDataCollator handles the complex tensor management required for dual-input training, ensuring proper batching of four distinct tensor streams (risk-averse and risk-neutral inputs, each with their respective attention masks) while maintaining type safety across different hardware platforms. The prompt engineering strategy—replacing thinking-based instructions with output-only commands—optimizes for reward model training by focusing on final choice evaluation rather than reasoning processes.
 
@@ -732,7 +703,7 @@ The multi-platform compatibility layer represents sophisticated device managemen
 
 The hybrid loss function architecture represents the system's most sophisticated component. The margin ranking loss provides the primary optimization signal, encouraging score separation between risk-averse and risk-neutral choices. The sigmoid component ensures continuous gradient flow even when margin constraints are satisfied, preventing training stagnation. The regularization term prevents score explosion while maintaining reasonable value ranges.
 
-The real-time debugging integration provides unprecedented visibility into training dynamics, displaying score distributions, preference rates, and loss component breakdowns during training. This introspective capability proved crucial for diagnosing convergence issues and validating that the model learns genuine risk preferences rather than artificial patterns.
+The real-time debugging integration provides visibility into training dynamics, displaying score distributions, preference rates, and loss component breakdowns during training. This capability enables monitoring convergence and validating that the model learns genuine risk preferences.
 
 **Evaluation Philosophy and Metrics**
 

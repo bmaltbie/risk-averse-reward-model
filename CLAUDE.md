@@ -4,7 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is a research project focused on training risk-averse reward models for LLMs. The goal is to train small language models (Qwen 1B) to prefer risk-averse choices over risk-neutral ones using data from `strict_disagreements_10k_with_prompts_and_bad_formats.csv`.
+This is a research project focused on training risk-averse reward models for LLMs. The goal is to train language models (TinyLlama 1.1B) to prefer risk-averse choices over risk-neutral ones using pairwise ranking loss and data from `strict_disagreements_10k_with_prompts_and_bad_formats.csv`.
+
+**Optimized for Google Colab with CUDA GPU support.**
+
+For project evolution and historical context, see [CHANGELOG.md](CHANGELOG.md).
 
 ## Key Files
 
@@ -19,57 +23,28 @@ This is a research project focused on training risk-averse reward models for LLM
 
 ## Development Commands
 
-### Local Execution
-```bash
-# Install dependencies
-pip install -r requirements.txt
-
-# Quick end-to-end test (recommended first step)
-# Uses memory-optimized settings: 0.5B model, 128 token sequences, fp16
-python test_experiment.py
-
-# Ensure full CSV data file is present for main experiment
-ls data/strict_disagreements_10k_with_prompts_and_bad_formats.csv
-
-# Run the full experiment
-python risk_averse_experiment.py
-
-# Check outputs
-ls outputs/  # Contains training plots and results JSON
-
-# For development/testing with data loading
-python -c "
-from risk_averse_experiment import RiskAversionDataLoader
-loader = RiskAversionDataLoader()
-data = loader.load_and_process_data()
-print(f'Loaded {len(data)} scenarios from CSV')
-"
-```
-
-### Google Colab
+### Google Colab (Recommended)
 - Upload `colab_notebook.ipynb` to Colab
+- **Enable GPU**: Runtime → Change runtime type → Hardware accelerator → GPU
 - For quick test: Upload `test_data.csv` and run test cells
 - For full experiment: Upload `strict_disagreements_10k_with_prompts_and_bad_formats.csv` to Colab
 - Run cells sequentially
 - Dependencies are installed automatically via `!pip install`
+- **Optimized for T4/V100 GPUs** with 16GB+ VRAM
 
-### Testing
+### Local Testing (Limited Support)
 
-Before running the full experiment, test the setup:
+For development only - main execution should be on Colab:
 
 ```bash
+# Install dependencies
+pip install -r requirements.txt
+
 # Quick test with minimal data (5 scenarios, 1 epoch)
 python test_experiment.py
 ```
 
-This test will:
-- ✓ Load test data from `test_data.csv`
-- ✓ Initialize the Qwen model and tokenizer
-- ✓ Create training datasets
-- ✓ Run minimal training (1 epoch)
-- ✓ Test evaluation and inference
-- ✓ Test plotting functionality
-- ✓ Clean up temporary files
+**Note**: Local execution is not optimized and may have memory limitations.
 
 ## Visualization Features
 
@@ -119,32 +94,35 @@ The experiment automatically generates comprehensive plots:
 3. **RiskAverseRewardModel**: Reward model with dual forward modes
    - **Pairwise mode**: Takes both risk-averse and risk-neutral inputs, optimizes ranking loss
    - **Single mode**: Standard evaluation mode for individual option scoring
-   - **Ranking Loss**: `margin - (risk_averse_score - risk_neutral_score)` with margin=1.0
-   - Directly optimizes for risk-averse choices scoring higher than risk-neutral ones
+   - **Hybrid Loss**: Combines margin ranking, sigmoid, and L2 regularization components
+   - Optimizes for risk-averse choices scoring higher than risk-neutral ones
 
 ### Training Pipeline
 - CSV data loading → Limit to 500 situations → Train/validation split → Tokenization → Transformer fine-tuning → Evaluation → Visualization
 - Uses Hugging Face Transformers with custom dataset and model classes
-- Memory-optimized for resource-constrained environments:
-  - 0.5B parameter model (vs 1.5B) - ~67% memory reduction
-  - 128 token sequences (vs 512) - ~75% sequence memory reduction
-  - Limited to 500 training situations for faster training
-  - Gradient accumulation maintains effective batch size while using minimal memory
+- **Colab GPU-optimized configuration**:
+  - 1.1B TinyLlama model for efficient performance with GPU memory
+  - 256 token sequences for improved context understanding
+  - Limited to 500 training situations for faster experimentation
+  - Gradient accumulation with larger batches for GPU efficiency
+  - Flash Attention and fused optimizers when available
 - Automatic plotting and visualization of training progress and results
 - Requires CSV file to be present - experiment will fail if data file is missing
 
 ## Model Configuration
 
-- Base model: `Qwen/Qwen2.5-0.5B` (optimized for memory efficiency)
+- Base model: `TinyLlama/TinyLlama-1.1B-Chat-v1.0` (optimized for Colab GPU performance)
 - Risk-averse utility function: `u(w) = 1 - e^(-0.01w)`
 - **Training uses Pairwise Ranking Loss** to directly optimize risk-averse preference
-- Margin-based loss: `max(0, margin - (risk_averse_score - risk_neutral_score))`
-- Always uses mixed precision (fp16) for memory savings on CUDA
-- Memory optimizations:
-  - Reduced sequence length: 128 tokens (vs 512)
-  - Small batch size (1) with gradient accumulation (4 steps)
-  - Half precision loading with `low_cpu_mem_usage=True`
-  - Disabled memory pinning for reduced overhead
+- Hybrid loss combining margin ranking, sigmoid, and L2 regularization
+- **GPU Optimizations for Colab**:
+  - Always uses fp16 mixed precision for memory efficiency
+  - Automatic device mapping with `device_map="auto"`
+  - Flash Attention 2 when available
+  - Fused AdamW optimizer (`adamw_torch_fused`)
+  - Sequence length: 256 tokens for better context
+  - Batch size: 2 with gradient accumulation (2 steps)
+  - Memory pinning enabled for faster GPU transfers
 - Comprehensive visualization:
   - Training/validation loss curves
   - Score distribution histograms

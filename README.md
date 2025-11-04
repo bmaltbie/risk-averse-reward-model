@@ -9,12 +9,11 @@ LLMs and artificial agents.
 
 
 PROJECT GOAL
-(1) Using a small, open source 1B Qwen model, train a reward model to be risk-averse (i.e. to train them to give higher 
-reward to risk-averse answers from LLMs). 
-(2) Use triples of {prompt_text, correct_label, incorrect_label} from the strict_disagreements_10k_with_prompts_and_bad_formats.csv 
-(perhaps including the bad versions) to finetune a reward model. No other data is needed besides data from this file.
-(3) Possibly delete the part of the prompt that says 'You can think about which you'd choose' and replace it with 
-something like 'Output the label of your chosen option only.'
+Train a reward model using an open source 1.1B TinyLlama model to prefer risk-averse choices over risk-neutral ones. The model uses pairwise ranking loss to directly optimize for risk-averse preference, trained on scenarios from the strict_disagreements_10k_with_prompts_and_bad_formats.csv file where risk-averse and risk-neutral agents disagree on optimal choices.
+
+**Optimized for Google Colab with GPU acceleration.**
+
+For implementation details and project evolution, see [CHANGELOG.md](CHANGELOG.md).
 
 
 DATA DESCRIPTION

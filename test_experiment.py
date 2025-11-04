@@ -56,7 +56,7 @@ def run_quick_test():
     # Test model initialization
     print("\n2. Testing model initialization...")
     try:
-        model_name = "Qwen/Qwen2.5-0.5B"  # Use smaller 0.5B model
+        model_name = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"  # Use TinyLlama for testing
         tokenizer = AutoTokenizer.from_pretrained(model_name)
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
@@ -79,7 +79,7 @@ def run_quick_test():
             train_df = dataset_df.iloc[:2]  # Use first 2 for training
             val_df = dataset_df.iloc[2:]    # Use last 1 for validation
         
-        train_dataset = PairwiseRiskAversionDataset(train_df, tokenizer, max_length=128)  # Even shorter sequences
+        train_dataset = PairwiseRiskAversionDataset(train_df, tokenizer, max_length=128)  # Keep shorter for testing
         val_dataset = PairwiseRiskAversionDataset(val_df, tokenizer, max_length=128)
         
         print(f"✓ Datasets created: {len(train_dataset)} train, {len(val_dataset)} validation situation pairs")
