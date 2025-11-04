@@ -2,6 +2,112 @@
 
 All notable changes to the risk-averse reward model project will be documented in this file.
 
+## [2.6.0] - Scale Up: Llama-3-8B with 10K Situations and 10 Epochs - 2025-11-04
+
+### Major Change: Massive Scale-Up to Test Task Learnability
+
+**After discovering the task requires learning CARA utility function, scaling up to test if it's learnable with more capacity and data.**
+
+### The Discovery
+
+Analysis of 100 situations revealed:
+- **98% EV consistency**: Risk-neutral options have higher expected value ✓
+- **78% variance consistency**: Risk-averse options have lower variance ✗
+
+This inconsistency revealed the labels are based on **CARA (Constant Absolute Risk Aversion) utility**:
+```
+u(w) = 1 - e^(-0.01w)
+```
+
+Not simple variance! The model must implicitly learn this exponential utility function from examples alone.
+
+### Why Previous Experiments Failed
+
+**TinyLlama 1.1B + 350 situations + 3 epochs was insufficient** because:
+1. **Task complexity**: Must learn graduate-level economics (CARA utility)
+2. **Insufficient capacity**: 1.1B parameters can't learn complex mathematical patterns
+3. **Too little data**: 350 situations not enough to discover the utility function
+4. **Too few epochs**: 3 epochs provides limited exposure to each example
+
+### The Scale-Up Solution
+
+Scaling up **71× in total training** to test if task is learnable:
+
+| Parameter | Previous | **New** | Multiplier |
+|-----------|----------|---------|------------|
+| Model | TinyLlama 1.1B | **Llama-3-8B** | 7× parameters |
+| Situations | 350 | **10,000** | 28× more data |
+| Examples | 700 | **20,000** | 28× |
+| Epochs | 3 | **10** | 3× |
+| Total steps | ~350 | **~25,000** | **71×** |
+| Training time | 5 min | **4-6 hours** | 48-72× |
+
+### Changes
+
+**Cell 0 (Header):**
+- Updated to reflect Llama-3-8B and scaled training
+- Added A100 GPU requirement
+- Documented 4-6 hour training time
+
+**Cell 9 (Model Documentation):**
+- Complete comparison table showing scale-up
+- Explanation of why CARA utility requires this scale
+- Memory optimization details for 8B model
+- Expected behavior with larger model
+
+**Cell 10 (RiskAverseRewardModel):**
+- Changed model: `TinyLlama/TinyLlama-1.1B-Chat-v1.0` → `meta-llama/Meta-Llama-3-8B`
+- Added `gradient_checkpointing_enable()` for memory efficiency
+- Added `torch_dtype="auto"` for optimal precision
+- Reduced debug output frequency (1% instead of 5%)
+
+**Cell 16 (Training Function):**
+- Epochs: 3 → **10**
+- Batch size: 4 → **1** (with 8× gradient accumulation = effective 8)
+- Learning rate: default → **2e-5** (standard for large models)
+- Warmup steps: 100 → **500**
+- Eval steps: 200 → **1000** (less frequent for efficiency)
+- Added `gradient_checkpointing=True`
+- Added `save_total_limit=3` (keep only 3 checkpoints)
+- Comprehensive training info printout
+
+**Cell 18 (Experiment Function):**
+- Removed 500-situation limit: Now uses ALL 10,000 situations
+- Updated printouts to show scale
+- Added `training_epochs` to results JSON
+
+### Hardware Requirements
+
+- **GPU**: A100 (40GB) recommended, minimum V100 (32GB)
+- **RAM**: High-RAM runtime on Colab
+- **Training time**: 4-6 hours (vs 5 minutes before)
+
+### Expected Results
+
+If the task IS learnable with more capacity:
+- Accuracy > 0.6 (clearly better than random 0.5)
+- Risk-averse preference > 0.6 (consistent preference)
+- Score distributions separate (green vs red bars)
+- Training loss continues decreasing over 10 epochs
+
+If results are STILL 0.5 accuracy:
+- Task may require chain-of-thought reasoning
+- May need explicit CARA utility features
+- May need even larger models (70B+)
+- Or task is fundamentally not learnable from text alone
+
+### Technical Rationale
+
+This scale-up tests the hypothesis that **the task is learnable but requires more capacity and data**.
+
+The 71× increase in total training should be sufficient for Llama-3-8B to:
+1. Learn to parse probability statements
+2. Approximate expected values from text
+3. Discover the CARA utility pattern across 10K examples
+4. Generalize to unseen test situations
+
+If this fails, we'll have strong evidence the task requires a different approach.
+
 ## [2.5.1] - CRITICAL FIX: Data Corruption in Labels - 2025-11-04
 
 ### Major Bug Fix: Corrupted Training Labels
