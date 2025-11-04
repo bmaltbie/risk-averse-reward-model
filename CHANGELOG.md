@@ -2,6 +2,93 @@
 
 All notable changes to the risk-averse reward model project will be documented in this file.
 
+## [2.5.1] - CRITICAL FIX: Data Corruption in Labels - 2025-11-04
+
+### Major Bug Fix: Corrupted Training Labels
+
+**🚨 ROOT CAUSE FOUND: The model was being trained on corrupted data from the start!**
+
+### The Problem
+
+The CSV data had a critical formatting issue:
+- `correct_label` and `incorrect_label` contained **negative indices** (e.g., "-1", "-2")
+- These indices **did not appear anywhere in the prompt text**
+- Prompts showed options like "(1)", "(2)", "(3)", "(4)" or "a", "b", "c"
+- But training examples said "Chosen option: -1" (which is never mentioned in context!)
+
+**Example of the corruption:**
+```
+Prompt text lists: (1), (2), (3), (4)
+correct_label: -1  ← Not in prompt!
+incorrect_label: -2  ← Not in prompt!
+
+Training input: "... options (1), (2), (3), (4) ... Chosen option: -1"
+Model asked to learn: Score "-1" as 1.0, score "-2" as 0.0
+But "-1" has ZERO relationship to the actual risk-averse option!
+```
+
+### Why Training Appeared to Work But Didn't
+
+1. **Training loss decreased** ✓ - Model learned to distinguish strings "-1" vs "-2"
+2. **But scores never separated** ✗ - Because:
+   - The pattern "-1"=high, "-2"=low doesn't generalize to new test data
+   - The negative indices are arbitrary and not semantically meaningful
+   - Different situations use different label formats (numbers vs letters)
+3. **Result**: 4 experiments, all with 0.5 accuracy and 0.0 preference
+
+This explains ALL the failures - we never trained the model on the actual task!
+
+### The Solution
+
+Fixed `RiskAversionDataLoader` to map negative indices to actual option labels:
+
+```python
+# Map negative indices to actual labels from labels_vector
+# -1 → labels_vector[0] = "(1)"
+# -2 → labels_vector[1] = "(2)"
+if correct_label.startswith('-'):
+    index = abs(int(correct_label)) - 1
+    labels_list = ast.literal_eval(labels_vector_str)
+    correct_label = labels_list[index]  # Now matches prompt format!
+```
+
+### Changes
+
+**Created `fix_csv_labels.py` script:**
+- Standalone Python script to permanently fix the CSV file
+- Maps negative indices to actual labels from `labels_vector` column
+- Fixed 5,040 labels total (2,520 correct_label + 2,520 incorrect_label)
+- Verification confirmed all negative labels successfully replaced
+- Fixed CSV replaces the original file (no separate filename needed)
+
+**Cell 6 (RiskAversionDataLoader):**
+- Clean, simple data loader with no runtime fixing logic
+- Uses original filename: `strict_disagreements_10k_with_prompts_and_bad_formats.csv`
+- Data is now pre-cleaned, so no additional checks needed
+
+**Example transformation:**
+```
+Before:
+  prompt: "... (1), (2), (3), (4) ..."
+  correct_label: "-1"
+  incorrect_label: "-2"
+
+After:
+  prompt: "... (1), (2), (3), (4) ..."
+  correct_label: "(1)"  ✓ Matches prompt!
+  incorrect_label: "(2)"  ✓ Matches prompt!
+```
+
+### Expected Results
+
+Now that the model is training on **correct, semantically meaningful labels**:
+- Model should learn to associate specific options with risk-averse behavior
+- Score distributions should finally separate
+- Accuracy should exceed 0.5
+- Risk-averse preference rate should exceed 0.0
+
+This was the missing piece all along - we can't learn patterns from corrupted data!
+
 ## [2.5.0] - Switch to Pure Single-Input Training - 2025-11-04
 
 ### Major Change: Abandon Mixed Training Entirely
