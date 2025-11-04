@@ -2,6 +2,98 @@
 
 All notable changes to the risk-averse reward model project will be documented in this file.
 
+## [2.5.0] - Switch to Pure Single-Input Training - 2025-11-04
+
+### Major Change: Abandon Mixed Training Entirely
+
+**After 3 failed experiments with mixed training, switching to pure single-input classification.**
+
+### Problem Diagnosis
+
+Mixed training (pairwise + single-input) **completely failed** across all variations:
+1. **Original mixed training** (v2.4.0): Accuracy 0.5, preference 0.0, scores at ~0.003
+2. **After removing L2** (v2.4.1): Accuracy 0.5, preference 0.0, scores at ~0.007
+3. **Consistent pattern**: Training loss decreased, but scores never differentiated
+
+**Root cause**: Pairwise and single-input training created **conflicting gradients**:
+- Pairwise task: "Score option A higher than option B within same context" (relative scoring)
+- Single-input task: "Score this option as 1.0 or 0.0" (absolute scoring)
+- Same model weights receiving contradictory optimization signals
+- Gradients likely canceling each other out → no learning
+
+### Solution: Pure Single-Input Classification
+
+**New approach - radical simplification**:
+- Train **ONLY** with single-input binary classification
+- Each example labeled: risk-averse=1.0, risk-neutral=0.0
+- Simple BCE loss: `BCEWithLogitsLoss(score, label)`
+- No pairwise comparisons, no margin loss, no mixed modes
+- Training matches evaluation (both single-input)
+
+### Changes
+
+**Dataset (Cell 8):**
+- Created simple `SingleInputDataset` class
+- Generates 2 examples per situation (risk-averse + risk-neutral)
+- Returns standard format: `{input_ids, attention_mask, labels}`
+- Removed all mixed training complexity (MixedTrainingDataset, ModeGroupedBatchSampler, MixedDataCollator)
+
+**Model (Cell 10):**
+- Simplified to single forward pass only
+- Removed all pairwise ranking logic
+- Pure BCE loss on individual examples
+- Increased debug print frequency (5% of batches)
+
+**Training (Cell 16):**
+- Uses standard HuggingFace Trainer (no custom batch sampler!)
+- Increased batch size: 1 → 4 (no memory issues with simpler approach)
+- Removed gradient accumulation (not needed with batch_size=4)
+- Simple collate function for labels
+
+**Documentation (Cell 9):**
+- Completely rewritten to explain pure single-input approach
+- Removed all pairwise/mixed training documentation
+- Clear explanation of why mixed training failed
+
+### Expected Results
+
+If this works, we should see:
+- **Score separation**: Risk-averse scores high (~0.7-1.0), risk-neutral low (~0.0-0.3)
+- **Accuracy > 0.5**: Better than random chance
+- **Risk-averse preference > 0.5**: Model prefers risk-averse options
+- **Clear histogram separation**: Green and red bars not overlapping
+- **Green zone scatter points**: Above diagonal line
+
+If this **still** doesn't work, it suggests:
+- The task itself is too hard for TinyLlama 1.1B
+- The prompt format doesn't provide enough signal
+- Need larger model or different approach entirely
+
+### Technical Rationale
+
+This is the simplest possible approach that matches training and evaluation:
+1. **No mode confusion**: Only one type of example
+2. **No gradient conflicts**: Single loss function
+3. **Direct supervision**: Clear labels (1.0 vs 0.0)
+4. **Standard architecture**: Works like any classification task
+
+If a model can't learn this simple task, it can't learn the complex mixed version either.
+
+### Hotfix: Device Mismatch in Forward Pass (Comprehensive Fix)
+- **Error**: `Expected all tensors to be on the same device, but got index is on cpu, different from other tensors on cuda:0 (when checking argument in method wrapper_CUDA__index_select)`
+- **Root Cause**: Multiple issues:
+  1. Tensors from collate function were on CPU
+  2. Manual validation step was passing CPU tensors to CUDA model
+  3. HuggingFace Trainer doesn't always move all custom tensors to device
+- **Fix**:
+  1. **Cell 10**: Modified forward pass to explicitly move ALL input tensors (input_ids, attention_mask, labels) to model device before processing
+  2. **Cell 16**: Removed manual validation step that was calling model with CPU tensors - let Trainer handle device placement
+- **Technical Details**:
+  - Get model device: `device = next(self.backbone.parameters()).device`
+  - Move all inputs: `input_ids = input_ids.to(device)` (and same for attention_mask and labels)
+  - Removed validation: No longer call `model(**sample_batch)` manually before training
+- **Why This Works**: Ensures all tensors are on CUDA before backbone forward pass, and avoids manual calls that bypass Trainer's device management
+
 ## [2.4.1] - Experimental: Remove L2 Regularization - 2025-11-04
 
 ### Experimental Change
