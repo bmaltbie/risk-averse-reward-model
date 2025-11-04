@@ -2,6 +2,98 @@
 
 All notable changes to the risk-averse reward model project will be documented in this file.
 
+## [2.4.0] - Mixed Training to Fix Training-Evaluation Mismatch - 2025-11-04
+
+### Major Changes
+- **CRITICAL FIX**: Implemented mixed training combining pairwise ranking + single-input classification
+- Replaced `PairwiseRiskAversionDataset` with `MixedTrainingDataset` that generates both pairwise and single-input examples
+- Created `MixedDataCollator` to handle batches of different modes
+- Updated model forward pass to detect and route between pairwise and single-input modes
+
+### Problem Diagnosed
+**Root cause of 0.5 accuracy and 0.0 risk-averse preference rate:**
+
+Previous implementation trained exclusively with pairwise examples (comparing risk-averse vs risk-neutral options together), but evaluated with single-input examples (scoring options one at a time). This created a fundamental mismatch:
+
+**Training (Pairwise Mode):**
+- Model learned: "Score option A higher than option B"
+- Learned **relative scoring**: which option is better
+- Never learned **absolute scoring**: what scores actually mean
+
+**Evaluation (Single-Input Mode):**
+- Model scored each option independently
+- No comparison context available
+- All scores collapsed to ~0 (untrained default from L2 regularization)
+- Result: 50% accuracy (random chance), 0% risk-averse preference
+
+**Evidence from plots:**
+- Score distributions: Both options identical, centered at 0
+- Risk preference scatter: All points on diagonal (no differentiation)
+- Score difference: +0.000 (perfect tie)
+- Training loss decreased, but didn't translate to evaluation
+
+### Solution: Mixed Training
+
+**New approach trains model in BOTH modes:**
+
+1. **Pairwise ranking** (33% of examples): Teaches relative scoring
+   - Input: Both options from same situation
+   - Loss: Hybrid (margin + Bradley-Terry + L2)
+   - Learns: "Risk-averse should score higher than risk-neutral"
+
+2. **Single-input classification** (67% of examples): Teaches absolute scoring
+   - Input: Individual options with labels (risk-averse=1.0, risk-neutral=0.0)
+   - Loss: Binary cross-entropy
+   - Learns: "Risk-averse options should score ~1, risk-neutral ~0"
+
+**Data expansion:**
+- Each situation generates 3 training examples (1 pairwise + 2 single-input)
+- Training data: 350 situations → 1,050 examples
+- Model learns both relative preferences AND score semantics
+
+### Added
+- `MixedTrainingDataset` class that generates both pairwise and single-input examples
+- `MixedDataCollator` for handling heterogeneous batches
+- Mode detection in model forward pass (`mode` parameter)
+- Debug logging for single-input training progress
+- Comprehensive documentation of mixed training approach
+
+### Changed
+- Dataset: `PairwiseRiskAversionDataset` → `MixedTrainingDataset` for training
+- Collator: `PairwiseDataCollator` → `MixedDataCollator` for training
+- Training examples per situation: 1 → 3 (1 pairwise + 2 single-input)
+- Model forward pass now detects mode and routes appropriately
+- Single-input forward pass enhanced with training support and debug logging
+
+### Fixed
+- **Training-evaluation mismatch**: Model now trains on the same input format used during evaluation
+- **Score collapse to zero**: Single-input training teaches absolute score meanings
+- **No risk-averse preference**: Model now learns to differentiate individual options
+- **Pairwise-only training limitation**: Combined approach leverages strengths of both methods
+
+### Technical Rationale
+
+The original pairwise-only approach is mathematically sound for learning rankings but fails when evaluation requires absolute scoring. Mixed training solves this by:
+
+1. **Pairwise training** provides strong supervision for relative preferences (margin ensures clear separation)
+2. **Single-input training** grounds these preferences in absolute scores (risk-averse=high, risk-neutral=low)
+3. **Combined effect** enables the model to both compare options AND score them independently
+
+This is similar to how human judgments work: we can compare options relatively ("A is better than B") and also evaluate them absolutely ("A is good, B is bad").
+
+### Expected Improvements
+
+After mixed training, we expect:
+- Accuracy: 0.5 → 0.65-0.75 (better than random)
+- Risk-averse preference rate: 0.0 → 0.60-0.75 (clear preference)
+- Score difference: 0.0 → positive (risk-averse scores higher)
+- Score distributions: Separated (risk-averse higher, risk-neutral lower)
+
+### Hotfix: IndexError in DataLoader
+- **Fixed**: Added `dataframe.reset_index(drop=True)` in `MixedTrainingDataset.__init__`
+- **Reasoning**: After `train_test_split`, DataFrame indices are non-sequential (e.g., [1, 3, 4] instead of [0, 1, 2]). Using these indices with `iloc[]` causes IndexError. Resetting to 0-based sequential indices fixes the mismatch.
+- **Changed**: Loop from `for idx, row in dataframe.iterrows()` to `for idx in range(len(self.data))`
+
 ## [2.3.0] - Colab T4 GPU Compatibility Fixes - 2025-11-04
 
 ### Added
