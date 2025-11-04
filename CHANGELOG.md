@@ -2,6 +2,28 @@
 
 All notable changes to the risk-averse reward model project will be documented in this file.
 
+## [2.4.1] - Experimental: Remove L2 Regularization - 2025-11-04
+
+### Experimental Change
+- **Removed L2 regularization from pairwise ranking loss**
+- **Hypothesis**: L2 regularization was dominating the loss function and pushing all scores toward zero, preventing the model from learning meaningful score separations
+- **Evidence from failed runs**:
+  - Scores centered at ~0.003 (nearly zero)
+  - Score distributions identical for both option types
+  - Perfect diagonal in risk preference scatter plot (no differentiation)
+  - Despite training loss decreasing, scores never moved away from initialization
+- **Change**: Modified pairwise loss from `margin_loss + 0.1 × bradley_terry + 0.01 × L2` to `margin_loss + 0.1 × bradley_terry`
+- **Reasoning**: L2 regularization penalty (0.01 × scores²) was fighting against margin loss (wants score_diff ≥ 1.0) and BCE loss (wants scores in 0-1 range). The conflict prevented gradient descent from moving scores away from zero.
+- **Expected Result**:
+  - Scores should spread out from zero
+  - Risk-averse options should score higher (positive values)
+  - Risk-neutral options should score lower (could go negative)
+  - Score distributions should separate
+- **Files Modified**:
+  - Cell 9: Updated loss documentation table to show L2 removed, added warning about experimental change
+  - Cell 10: Removed `score_regularization` calculation and removed it from `total_loss`, updated debug print statement label
+- **Rollback Plan**: If this doesn't work, we can restore L2 with much smaller weight (0.0001) or try other theories
+
 ## [2.4.0] - Mixed Training to Fix Training-Evaluation Mismatch - 2025-11-04
 
 ### Major Changes
