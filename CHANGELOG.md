@@ -2,6 +2,219 @@
 
 All notable changes to the risk-averse reward model project will be documented in this file.
 
+## [2.10.0] - Standalone Python Script for Cloud GPU - 2025-11-12
+
+### Major Addition: Production-Ready Python Script
+
+**Added `experiment.py` - standalone Python script for SSH/cloud GPU execution.**
+
+### New File: `experiment.py`
+
+Converted `colab_notebook.ipynb` into a production-ready CLI tool for running experiments on cloud GPUs via SSH.
+
+### Features
+
+1. **CLI Arguments with Defaults**:
+   - `--model` (default: Qwen/Qwen3-8B)
+   - `--data` (default: data/11_7_low_stakes_training_set.csv)
+   - `--epochs` (default: 10)
+   - `--batch-size` (default: 1)
+   - `--learning-rate` (default: 2e-5)
+   - `--max-length` (default: 128)
+   - `--output-dir` (default: outputs/)
+
+2. **Dual Logging**: Logs to both console and timestamped file (`logs/experiment_TIMESTAMP.log`)
+
+3. **Headless Plotting**: Uses matplotlib 'Agg' backend, saves plots only (no display)
+
+4. **All Notebook Functionality**:
+   - RiskAversionDataLoader
+   - SingleInputDataset
+   - RiskAverseRewardModel
+   - Complete training pipeline
+   - Evaluation with detailed metrics
+   - 4-panel visualization
+
+### Usage Examples
+
+```bash
+# Default configuration
+python experiment.py
+
+# Custom data path
+python experiment.py --data /path/to/custom_data.csv
+
+# Full customization
+python experiment.py \
+  --model Qwen/Qwen3-8B \
+  --data data/11_7_low_stakes_training_set.csv \
+  --epochs 15 \
+  --batch-size 2 \
+  --learning-rate 1e-5 \
+  --output-dir my_results/
+
+# View all options
+python experiment.py --help
+```
+
+### Cloud GPU Workflow
+
+```bash
+# 1. SSH into cloud GPU
+ssh user@gpu-server
+
+# 2. Clone repository
+git clone <repo-url>
+cd risk-averse-reward-model
+
+# 3. Install dependencies
+pip install transformers datasets accelerate torch pandas numpy scikit-learn matplotlib seaborn
+
+# 4. Run experiment
+python experiment.py --data data/11_7_low_stakes_training_set.csv
+
+# 5. Results saved to:
+#    - outputs/experiment_results.json
+#    - outputs/training_results_TIMESTAMP.png
+#    - logs/experiment_TIMESTAMP.log
+```
+
+### Key Differences from Notebook
+
+- **Removed**: All `print("✓ ... defined")` statements
+- **Removed**: Colab-specific code (file upload/download)
+- **Removed**: `plt.show()` calls (save-only plotting)
+- **Added**: Comprehensive logging system
+- **Added**: Command-line argument parsing
+- **Added**: Proper exception handling with logging
+- **Added**: Executable shebang (`#!/usr/bin/env python3`)
+
+### Technical Details
+
+- **Matplotlib backend**: Set to 'Agg' before imports for headless environment
+- **Logging format**: Timestamps in file, clean output to console
+- **Exit codes**: Returns 0 on success, 1 on error
+- **Memory efficient**: Closes plots after saving to free memory
+
+### File Structure
+
+All functionality from 25 notebook cells condensed into:
+- ~550 lines of clean, documented Python code
+- Organized into Classes, Functions, CLI, and Main sections
+- Production-ready with proper error handling
+
+## [2.9.0] - Switch to Qwen3-8B - 2025-11-11
+
+### Major Change: Model Upgrade to Qwen3
+
+**Upgrading from Qwen2.5-8B-Instruct to Qwen3-8B for latest architecture improvements.**
+
+### Rationale
+
+**Why Qwen3-8B?**
+
+1. **Latest architecture**: Qwen3 represents the newest generation with architectural improvements
+2. **Enhanced capabilities**: Better performance across reasoning and instruction-following tasks
+3. **Maintained efficiency**: Same 8B parameter count with improved training techniques
+4. **Continued open access**: Fully open model for research use
+
+### Changes
+
+**Cell 0 (Header Documentation):**
+- Updated model name: Qwen2.5-8B-Instruct → Qwen3-8B
+
+**Cell 9 (Model Documentation):**
+- Updated model reference throughout
+- Updated "Why Qwen3-8B?" section
+
+**Cell 10 (RiskAverseRewardModel):**
+- Default model: `Qwen/Qwen2.5-8B-Instruct` → `Qwen/Qwen3-8B`
+
+**Cell 16 (Training Function):**
+- Default model parameter: `Qwen/Qwen2.5-8B-Instruct` → `Qwen/Qwen3-8B`
+
+**Cell 18 (Experiment Function):**
+- Updated model name in printouts and results JSON
+
+**CLAUDE.md:**
+- Updated all model references from Qwen2.5-8B-Instruct to Qwen3-8B
+- Updated Architecture section with new model backbone
+- Updated Model Configuration section
+- Updated Training Pipeline section
+
+### Technical Details
+
+Model specifications remain the same:
+- 8 billion parameters
+- Gradient checkpointing enabled
+- fp16 mixed precision
+- Same training hyperparameters
+- Same memory requirements (A100 GPU)
+- Same expected training time (30-60 minutes)
+
+### Expected Results
+
+Qwen3-8B may show improved performance due to:
+- Latest architectural improvements
+- Enhanced training methodology
+- Better instruction comprehension
+
+## [2.8.0] - Switch to Qwen2.5-8B-Instruct - 2025-11-11
+
+### Major Change: Model Switch from Llama to Qwen
+
+**Switching from Meta-Llama-3-8B to Qwen2.5-8B-Instruct for better instruction following.**
+
+### Rationale
+
+**Why Qwen2.5-8B-Instruct?**
+
+1. **Strong instruction-following**: Specifically trained for following instructions and prompts
+2. **Efficient architecture**: Optimized for both training and inference
+3. **Better reasoning**: Strong performance on mathematical and logical reasoning tasks
+4. **Open weights**: Fully open model suitable for research use
+5. **Active development**: Recent model with modern training techniques
+
+### Changes
+
+**Cell 0 (Header Documentation):**
+- Updated model name: Llama-3-8B → Qwen2.5-8B-Instruct
+
+**Cell 9 (Model Documentation):**
+- Updated model reference throughout
+- Added "Why Qwen2.5-8B?" section explaining benefits
+
+**Cell 10 (RiskAverseRewardModel):**
+- Default model: `meta-llama/Meta-Llama-3-8B` → `Qwen/Qwen2.5-8B-Instruct`
+
+**Cell 16 (Training Function):**
+- Default model parameter: `meta-llama/Meta-Llama-3-8B` → `Qwen/Qwen2.5-8B-Instruct`
+
+**Cell 18 (Experiment Function):**
+- Updated model name in printouts and results JSON
+
+**CLAUDE.md:**
+- Updated all model references from Llama-3-8B to Qwen2.5-8B-Instruct
+- Updated Architecture section with new model backbone
+- Updated Model Configuration section
+
+### Technical Details
+
+Model specifications remain the same:
+- 8 billion parameters
+- Gradient checkpointing enabled
+- fp16 mixed precision
+- Same training hyperparameters
+- Same memory requirements (A100 GPU)
+- Same expected training time (30-60 minutes)
+
+### Expected Results
+
+Qwen2.5-8B-Instruct may show improved performance due to:
+- Better instruction comprehension
+- Stronger reasoning capabilities
+- More efficient training convergence
+
 ## [2.7.0] - Switch to Low-Stakes Training Dataset - 2025-11-11
 
 ### Major Change: New Dataset with Explicit CARA vs LINEAR Labels
