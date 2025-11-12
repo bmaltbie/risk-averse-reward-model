@@ -2,6 +2,142 @@
 
 All notable changes to the risk-averse reward model project will be documented in this file.
 
+## [2.7.0] - Switch to Low-Stakes Training Dataset - 2025-11-11
+
+### Major Change: New Dataset with Explicit CARA vs LINEAR Labels
+
+**Switching from 10K mixed-stakes situations to 1,000 low-stakes situations with explicit utility markers.**
+
+### The New Dataset
+
+**File**: `data/11_7_low_stakes_training_set.csv`
+
+Key characteristics:
+- **1,000 unique situations** (vs 10,000 in previous dataset)
+- **Low-stakes gambles**: $0-$100 range monetary outcomes
+- **Explicit utility labeling**:
+  - `is_best_cara = True`: Marks risk-averse option (CARA utility maximizer)
+  - `is_best_linear = True`: Marks risk-neutral option (LINEAR utility maximizer)
+- **Multi-row format**: Each situation has 2-5 option rows
+- **0-indexed options**: `option_index` in data, but prompts use 1-indexed numbers
+
+### Format Changes
+
+**Old format** (`strict_disagreements_10k_with_prompts_and_bad_formats.csv`):
+```
+situation_id | prompt_text | correct_label | incorrect_label | bad_correct_answers | bad_incorrect_answers
+```
+- One row per situation
+- Labels were option numbers/letters
+- Included bad answer variations
+
+**New format** (`11_7_low_stakes_training_set.csv`):
+```
+situation_id | option_index | prompt_text | is_best_cara | is_best_linear | num_options | outcomes | probs_percent | EU_cara | EU_linear
+```
+- Multiple rows per situation (one per option)
+- Explicit utility markers instead of pre-labeled correct/incorrect
+- No bad answer variations
+- Includes utility calculations for verification
+
+### Changes
+
+**Cell 0 (Header Documentation):**
+- Updated CSV filename: `strict_disagreements_10k_with_prompts_and_bad_formats.csv` → `11_7_low_stakes_training_set.csv`
+- Training scale: 10,000 → 1,000 situations
+- Training examples: 20,000 → 2,000
+- Training steps: ~25,000 → ~2,500
+- Training time: 4-6 hours → 30-60 minutes on A100
+- Added "CARA vs LINEAR Utility" feature description
+
+**Cell 6 (RiskAversionDataLoader):**
+- Complete rewrite to handle multi-row-per-situation format
+- Default CSV path: `11_7_low_stakes_training_set.csv`
+- New logic:
+  - Groups by `situation_id`
+  - Finds row where `is_best_cara == True` (risk-averse option)
+  - Finds row where `is_best_linear == True` (risk-neutral option)
+  - Converts 0-indexed `option_index` to 1-indexed option numbers
+- Removed: `bad_correct_answers` / `bad_incorrect_answers` handling
+- Added: Skips situations missing CARA or LINEAR best options (though all 1,000 have both)
+
+**Cell 9 (Model Documentation):**
+- Updated training scale table (1,000 situations, 2,000 examples, ~2,500 steps)
+- Added "Dataset: Low-Stakes Gambles" section explaining new data format
+- Added "Why Low Stakes?" section explaining benefits
+- Updated training distribution numbers
+
+**Cell 12 (Evaluation Function):**
+- Removed all `bad_correct_answers` / `bad_incorrect_answers` handling
+- Simplified to test only main options (no variations)
+- Removed `bad_variation_matches` counter
+- Progress reporting: every 25 → every 50 situations (smaller dataset)
+- Cleaner, more readable code (~50% fewer lines)
+
+**Cell 16 (Training Function):**
+- Adjusted hyperparameters for smaller dataset:
+  - Warmup steps: 500 → 100
+  - Logging steps: 100 → 50 (more frequent)
+  - Eval steps: 1000 → 250 (more frequent)
+  - Save steps: 1000 → 250
+- Training time estimate: 4-6 hours → 30-60 minutes
+
+**Cell 18 (Experiment Function):**
+- Updated to reference new CSV filename in printout
+- Added `"dataset": "11_7_low_stakes_training_set.csv"` to results JSON
+- Updated comments and documentation strings
+
+**Cell 19-20 (Execution Cells):**
+- Updated file references in markdown and error messages
+- Updated to mention new CSV filename
+
+### Rationale
+
+**Why switch to low-stakes data?**
+
+1. **Simpler numerical patterns**: $0-$100 range is easier for the model to process than mixed stakes ranging from cents to millions
+2. **More consistent risk behavior**: Low-stakes gambles show clearer CARA vs LINEAR utility differences
+3. **Explicit labeling**: `is_best_cara` and `is_best_linear` flags make data provenance transparent
+4. **Faster iteration**: 1,000 situations = 30-60 min training instead of 4-6 hours
+5. **Verification data**: Includes `EU_cara` and `EU_linear` columns for validation
+6. **No format ambiguity**: No `bad_correct_answers` variations to handle
+
+### Data Validation
+
+**Verified**:
+- ✓ All 1,000 situations have both CARA and LINEAR best options
+- ✓ Options correctly converted from 0-indexed to 1-indexed
+- ✓ No situations skipped (perfect data quality)
+- ✓ Prompts use 1-indexed numbering matching our labels
+
+**Example transformation**:
+```python
+# Raw data (0-indexed)
+option_index = 0, is_best_cara = True   # First option (index 0)
+option_index = 1, is_best_linear = True  # Second option (index 1)
+
+# Processed (1-indexed for prompts)
+correct_label = "1"    # Risk-averse option (shown as "1" in prompt)
+incorrect_label = "2"  # Risk-neutral option (shown as "2" in prompt)
+```
+
+### Expected Results
+
+With cleaner, lower-stakes data:
+- Should see same or better learning as previous attempts
+- Faster experimentation cycle (30-60 min vs 4-6 hours)
+- More transparent data provenance
+- Easier debugging with explicit utility columns
+
+### Testing
+
+Tested `RiskAversionDataLoader` with new CSV:
+- ✓ Successfully loaded 3,000 rows
+- ✓ Processed to 1,000 unique situations
+- ✓ All required columns present
+- ✓ Option labels correctly formatted as strings ("1", "2", etc.)
+- ✓ Sample outputs show correct CARA/LINEAR mapping
+
 ## [2.6.0] - Scale Up: Llama-3-8B with 10K Situations and 10 Epochs - 2025-11-04
 
 ### Major Change: Massive Scale-Up to Test Task Learnability
