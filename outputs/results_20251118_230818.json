@@ -1,0 +1,21 @@
+{
+  "model_name": "Qwen/Qwen3-8B",
+  "final_validation_accuracy": 0.65,
+  "final_validation_loss": 0.6261120752524585,
+  "best_validation_accuracy": 0.65,
+  "mean_preferred_score": 6.900708198547363,
+  "mean_rejected_score": 3.9287962913513184,
+  "score_difference": 2.971911907196045,
+  "margin_mean": 2.9719109535217285,
+  "margin_std": 4.47854471206665,
+  "correct_rankings": 130,
+  "incorrect_rankings": 32,
+  "tied_rankings": 38,
+  "num_epochs": 5,
+  "batch_size": 2,
+  "learning_rate": 0.0005,
+  "weight_decay": 0.01,
+  "training_samples": 800,
+  "validation_samples": 200,
+  "timestamp": "20251118_230818"
+}
