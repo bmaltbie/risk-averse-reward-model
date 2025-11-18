@@ -1,8 +1,0 @@
-{
-  "num_training_situations": 350,
-  "num_test_situations": 150,
-  "final_accuracy": 0.5,
-  "risk_averse_preference_rate": 0.0,
-  "model_name": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-  "timestamp": "2025-11-04T20:01:33.500072"
-}
