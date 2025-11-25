@@ -1,0 +1,38 @@
+{
+  "model_name": "Qwen/Qwen3-8B",
+  "baseline": {
+    "accuracy": 0.4,
+    "loss": 0.6857871198654175,
+    "mean_margin": 0.03277943655848503,
+    "std_margin": 0.26832908391952515
+  },
+  "trained": {
+    "final_validation_accuracy": 0.6,
+    "final_validation_loss": 0.38021701328456403,
+    "best_validation_accuracy": 0.625,
+    "mean_preferred_score": -0.9921911358833313,
+    "mean_rejected_score": -3.5353784561157227,
+    "score_difference": 2.543187379837036,
+    "margin_mean": 2.543186902999878,
+    "margin_std": 2.948904514312744,
+    "correct_rankings": 120,
+    "incorrect_rankings": 16,
+    "tied_rankings": 64
+  },
+  "improvement": {
+    "accuracy_gain": 0.19999999999999996,
+    "accuracy_gain_percent": 19.999999999999996,
+    "loss_reduction": 0.3055701065808535,
+    "margin_improvement": 2.5104074478149414
+  },
+  "config": {
+    "num_epochs": 5,
+    "epochs_trained": 5,
+    "batch_size": 2,
+    "learning_rate": 0.0005,
+    "weight_decay": 0.01,
+    "training_samples": 800,
+    "validation_samples": 200
+  },
+  "timestamp": "20251125_112841"
+}
