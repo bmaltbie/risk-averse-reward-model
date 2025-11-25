@@ -1,0 +1,53 @@
+{
+  "model_name": "Qwen/Qwen3-8B",
+  "architecture": {
+    "type": "LoRA + Reward Head",
+    "lora_config": {
+      "r": 8,
+      "alpha": 16,
+      "dropout": 0.05,
+      "target_modules": [
+        "q_proj",
+        "v_proj"
+      ]
+    },
+    "trainable_params": 3837953,
+    "total_params": 7572243457,
+    "trainable_percent": 0.050684490293983954
+  },
+  "baseline": {
+    "accuracy": 0.23,
+    "loss": 0.7262709724903107,
+    "mean_margin": -0.0528419204056263,
+    "std_margin": 0.22634121775627136
+  },
+  "trained": {
+    "final_validation_accuracy": 0.665,
+    "final_validation_loss": 0.25904223909572466,
+    "best_validation_accuracy": 0.675,
+    "mean_preferred_score": 5.426745414733887,
+    "mean_rejected_score": -1.7214629650115967,
+    "score_difference": 7.1482086181640625,
+    "margin_mean": 7.1482086181640625,
+    "margin_std": 6.155819416046143,
+    "correct_rankings": 133,
+    "incorrect_rankings": 3,
+    "tied_rankings": 64
+  },
+  "improvement": {
+    "accuracy_gain": 0.43500000000000005,
+    "accuracy_gain_percent": 43.50000000000001,
+    "loss_reduction": 0.46722873339458604,
+    "margin_improvement": 7.201050758361816
+  },
+  "config": {
+    "num_epochs": 10,
+    "epochs_trained": 10,
+    "batch_size": 2,
+    "learning_rate": 0.0002,
+    "weight_decay": 0.01,
+    "training_samples": 800,
+    "validation_samples": 200
+  },
+  "timestamp": "20251125_144619"
+}
