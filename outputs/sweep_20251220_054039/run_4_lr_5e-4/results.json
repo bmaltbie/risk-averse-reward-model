@@ -1,0 +1,57 @@
+{
+  "config": {
+    "name": "lr_5e-4",
+    "learning_rate": 0.0005,
+    "lora_r": 8,
+    "lora_alpha": 16,
+    "lora_dropout": 0.05,
+    "lora_target_modules": [
+      "q_proj",
+      "v_proj"
+    ],
+    "model_name": "Qwen/Qwen3-8B",
+    "batch_size": 2,
+    "gradient_accumulation_steps": 4,
+    "num_epochs": 10,
+    "weight_decay": 0.01,
+    "max_length": 256,
+    "in_dist_val_split": 0.1,
+    "random_seed": 42
+  },
+  "baseline": {
+    "out_dist_accuracy": 0.2967581047381546,
+    "in_dist_accuracy": 0.7
+  },
+  "trained": {
+    "out_dist_accuracy": 0.3940149625935162,
+    "in_dist_accuracy": 0.4,
+    "best_out_dist_accuracy": 0.39900249376558605,
+    "error_type_breakdown": {
+      "too_risky": {
+        "accuracy": 0.4,
+        "correct": 88,
+        "total": 220
+      },
+      "too_risk_averse": {
+        "accuracy": 0.5114503816793893,
+        "correct": 67,
+        "total": 131
+      },
+      "other": {
+        "accuracy": 0.06,
+        "correct": 3,
+        "total": 50
+      }
+    }
+  },
+  "improvement": {
+    "out_dist_accuracy_gain": 0.09725685785536159,
+    "in_dist_accuracy_gain": -0.29999999999999993
+  },
+  "training_time_minutes": 5.05722812016805,
+  "data": {
+    "train_samples": 90,
+    "in_dist_val_samples": 10,
+    "out_dist_val_samples": 401
+  }
+}

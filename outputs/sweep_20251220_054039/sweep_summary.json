@@ -1,0 +1,71 @@
+{
+  "sweep_timestamp": "20251220_061105",
+  "total_runs": 6,
+  "total_time_minutes": 30.435014394919076,
+  "best_config": {
+    "name": "lr_5e-4",
+    "out_dist_accuracy": 0.3940149625935162
+  },
+  "runs_ranked": [
+    {
+      "rank": 1,
+      "name": "lr_5e-4",
+      "learning_rate": 0.0005,
+      "lora_r": 8,
+      "out_dist_accuracy": 0.3940149625935162,
+      "in_dist_accuracy": 0.4,
+      "best_out_dist_accuracy": 0.39900249376558605,
+      "training_time_minutes": 5.05722812016805
+    },
+    {
+      "rank": 2,
+      "name": "lora_r16",
+      "learning_rate": 0.0002,
+      "lora_r": 16,
+      "out_dist_accuracy": 0.3566084788029925,
+      "in_dist_accuracy": 0.4,
+      "best_out_dist_accuracy": 0.3690773067331671,
+      "training_time_minutes": 5.221107534567515
+    },
+    {
+      "rank": 3,
+      "name": "lr_2e-4",
+      "learning_rate": 0.0002,
+      "lora_r": 8,
+      "out_dist_accuracy": 0.33665835411471323,
+      "in_dist_accuracy": 0.4,
+      "best_out_dist_accuracy": 0.34413965087281795,
+      "training_time_minutes": 5.044629685084025
+    },
+    {
+      "rank": 4,
+      "name": "lr_5e-5",
+      "learning_rate": 5e-05,
+      "lora_r": 8,
+      "out_dist_accuracy": 0.32917705735660846,
+      "in_dist_accuracy": 0.5,
+      "best_out_dist_accuracy": 0.32917705735660846,
+      "training_time_minutes": 4.996050910154978
+    },
+    {
+      "rank": 5,
+      "name": "lora_r4",
+      "learning_rate": 0.0002,
+      "lora_r": 4,
+      "out_dist_accuracy": 0.32418952618453867,
+      "in_dist_accuracy": 0.6,
+      "best_out_dist_accuracy": 0.3341645885286783,
+      "training_time_minutes": 5.064859346548716
+    },
+    {
+      "rank": 6,
+      "name": "lr_1e-4",
+      "learning_rate": 0.0001,
+      "lora_r": 8,
+      "out_dist_accuracy": 0.3192019950124688,
+      "in_dist_accuracy": 0.6,
+      "best_out_dist_accuracy": 0.3740648379052369,
+      "training_time_minutes": 5.045439092318217
+    }
+  ]
+}
