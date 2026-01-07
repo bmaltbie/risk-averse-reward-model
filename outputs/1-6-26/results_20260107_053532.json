@@ -1,0 +1,140 @@
+{
+  "model_name": "Qwen/Qwen3-8B",
+  "architecture": {
+    "type": "LoRA + Reward Head",
+    "lora_config": {
+      "r": 8,
+      "alpha": 16,
+      "dropout": 0.05,
+      "target_modules": [
+        "q_proj",
+        "v_proj"
+      ]
+    },
+    "trainable_params": 3837953,
+    "total_params": 7572243457,
+    "trainable_percent": 0.050684490293983954
+  },
+  "data": {
+    "training_file": "data/2025_12_5_training_set_low_stakes_balanced.csv",
+    "out_dist_validation_file": "data/2025_12_5_val_set_medium_stakes_balanced.csv",
+    "in_dist_val_split": 0.1,
+    "training_label_type": "CARA (risk-aversion)",
+    "in_dist_validation_label_type": "CARA (risk-aversion)",
+    "out_dist_validation_label_type": "cooperate"
+  },
+  "baseline": {
+    "in_dist": {
+      "accuracy": 0.56,
+      "loss": 0.5846222856640816,
+      "mean_margin": 0.4292573630809784,
+      "error_type_breakdown": {
+        "too_risky": {
+          "accuracy": 0.56,
+          "correct": 28.0,
+          "total": 50.0
+        },
+        "too_risk_averse": {
+          "accuracy": 0.0,
+          "correct": 0.0,
+          "total": 0.0
+        },
+        "other": {
+          "accuracy": 0.0,
+          "correct": 0.0,
+          "total": 0.0
+        }
+      }
+    },
+    "out_dist": {
+      "accuracy": 0.2817955112219451,
+      "loss": 0.6969392281815299,
+      "mean_margin": 0.005011493340134621,
+      "error_type_breakdown": {
+        "too_risky": {
+          "accuracy": 0.2909090909090909,
+          "correct": 64.0,
+          "total": 220.0
+        },
+        "too_risk_averse": {
+          "accuracy": 0.366412213740458,
+          "correct": 48.0,
+          "total": 131.0
+        },
+        "other": {
+          "accuracy": 0.02,
+          "correct": 1.0,
+          "total": 50.0
+        }
+      }
+    }
+  },
+  "trained": {
+    "in_dist": {
+      "final_accuracy": 1.0,
+      "final_loss": 0.007492632336209226,
+      "mean_margin": 14.992918968200684,
+      "error_type_breakdown": {
+        "too_risky": {
+          "accuracy": 1.0,
+          "correct": 50.0,
+          "total": 50.0
+        },
+        "too_risk_averse": {
+          "accuracy": 0.0,
+          "correct": 0.0,
+          "total": 0.0
+        },
+        "other": {
+          "accuracy": 0.0,
+          "correct": 0.0,
+          "total": 0.0
+        }
+      }
+    },
+    "out_dist": {
+      "final_accuracy": 0.3092269326683292,
+      "final_loss": 0.7309003857305817,
+      "best_accuracy": 0.3117206982543641,
+      "mean_margin": 0.029251636937260628,
+      "error_type_breakdown": {
+        "too_risky": {
+          "accuracy": 0.33181818181818185,
+          "correct": 73.0,
+          "total": 220.0
+        },
+        "too_risk_averse": {
+          "accuracy": 0.366412213740458,
+          "correct": 48.0,
+          "total": 131.0
+        },
+        "other": {
+          "accuracy": 0.06,
+          "correct": 3.0,
+          "total": 50.0
+        }
+      }
+    }
+  },
+  "improvement": {
+    "in_dist": {
+      "accuracy_gain": 0.43999999999999995,
+      "accuracy_gain_percent": 43.99999999999999
+    },
+    "out_dist": {
+      "accuracy_gain": 0.027431421446384052,
+      "accuracy_gain_percent": 2.743142144638405
+    }
+  },
+  "config": {
+    "num_epochs": 10,
+    "epochs_trained": 10,
+    "batch_size": 1,
+    "learning_rate": 0.0002,
+    "weight_decay": 0.01,
+    "training_samples": 450,
+    "in_dist_validation_samples": 50,
+    "out_dist_validation_samples": 401
+  },
+  "timestamp": "20260107_053532"
+}

@@ -47,28 +47,37 @@ class SweepConfig:
     lora_target_modules: List[str] = field(default_factory=lambda: ["q_proj", "v_proj"])
     # Fixed params
     model_name: str = "Qwen/Qwen3-8B"
-    batch_size: int = 2
-    gradient_accumulation_steps: int = 4
+    batch_size: int = 1
+    gradient_accumulation_steps: int = 8
     num_epochs: int = 10
     weight_decay: float = 0.01
     max_length: int = 256
     in_dist_val_split: float = 0.10
     random_seed: int = 42
+    # CoT training options
+    use_cot: bool = True
+    cot_max_length: int = 1024  # Reduced for memory efficiency (actual usage ~515 tokens)
 
 
 # Default sweep configurations
+# Note: use_cot defaults to True, so label-only configs explicitly set use_cot=False
 SWEEP_CONFIGS = [
-    SweepConfig(name="lr_5e-5", learning_rate=5e-5),
-    SweepConfig(name="lr_1e-4", learning_rate=1e-4),
-    SweepConfig(name="lr_2e-4", learning_rate=2e-4),  # baseline
-    SweepConfig(name="lr_5e-4", learning_rate=5e-4),
-    SweepConfig(name="lora_r4", lora_r=4, lora_alpha=8),
-    SweepConfig(name="lora_r16", lora_r=16, lora_alpha=32),
+    # Label-only configurations (for comparison)
+    SweepConfig(name="label_lr_1e-4", learning_rate=1e-4, use_cot=False),
+    SweepConfig(name="label_lr_2e-4", learning_rate=2e-4, use_cot=False),  # label-only baseline
+    # CoT (Chain-of-Thought) configurations - default
+    SweepConfig(name="cot_lr_5e-5", learning_rate=5e-5),
+    SweepConfig(name="cot_lr_1e-4", learning_rate=1e-4),
+    SweepConfig(name="cot_lr_2e-4", learning_rate=2e-4),  # CoT baseline
+    SweepConfig(name="cot_lr_5e-4", learning_rate=5e-4),
+    SweepConfig(name="cot_lora_r4", lora_r=4, lora_alpha=8),
+    SweepConfig(name="cot_lora_r16", lora_r=16, lora_alpha=32),
 ]
 
 # Data file paths
 TRAIN_DATA_FILE = "data/2025_12_5_training_set_low_stakes_balanced.csv"
 VAL_DATA_FILE = "data/2025_12_5_val_set_medium_stakes_balanced.csv"
+COT_TRAIN_DATA_FILE = "data/2026_01_04_CLEANED_training_set_CoTs_500_from_Sonnet_4_5.csv"
 
 
 # ============================================================
@@ -160,6 +169,60 @@ class TrainingDataLoader:
                     'low_bucket_label': low_bucket,
                 })
             except (json.JSONDecodeError, KeyError):
+                continue
+
+        return pd.DataFrame(processed)
+
+
+class CoTTrainingDataLoader:
+    """Load and process Chain-of-Thought training data.
+
+    This loader works with pre-generated CoT data where each row contains:
+    - situation_id: Unique identifier for the situation
+    - prompt_text: The decision scenario
+    - chosen_full: Full CoT response for the correct answer (includes <think> tags)
+    - rejected_full: Full CoT response for the incorrect answer
+    - rejected_type: Type of rejection (too_risk, lin, etc.)
+    - low_bucket_label: Original bucket label for the situation
+    """
+
+    def __init__(self, csv_file_path: str, random_seed: int = 42, situation_ids: List = None):
+        self.csv_file_path = csv_file_path
+        self.rng = np.random.default_rng(random_seed)
+        self.situation_ids = situation_ids
+
+    def load_and_process_data(self) -> pd.DataFrame:
+        df = pd.read_csv(self.csv_file_path)
+
+        if self.situation_ids is not None:
+            df = df[df['situation_id'].isin(self.situation_ids)]
+
+        processed = []
+        for _, row in df.iterrows():
+            try:
+                # Map rejected_type to error_type for consistency
+                rejected_type = row.get('rejected_type', '')
+                if rejected_type == 'too_risk':
+                    error_type = 'too_risky'
+                elif rejected_type == 'lin':
+                    error_type = 'too_risky'  # linear = risk-neutral = too risky
+                elif rejected_type == '010':
+                    error_type = 'too_risk_averse'
+                else:
+                    error_type = 'other'
+
+                processed.append({
+                    'situation_id': row['situation_id'],
+                    'prompt_text': row['prompt_text'],
+                    'chosen_full': row['chosen_full'],
+                    'rejected_full': row['rejected_full'],
+                    'correct_label': row.get('chosen_answer', ''),
+                    'incorrect_label': row.get('rejected_answer', ''),
+                    'error_type': error_type,
+                    'low_bucket_label': row.get('low_bucket_label', ''),
+                })
+            except KeyError as e:
+                print(f"Warning: Missing key {e} in row {row.get('situation_id', 'unknown')}")
                 continue
 
         return pd.DataFrame(processed)
@@ -325,13 +388,22 @@ class ValidationDataLoader:
 # DATASET
 # ============================================================
 class PairwiseRewardDataset(Dataset):
-    """Dataset for pairwise reward model training."""
+    """Dataset for pairwise reward model training.
+
+    Supports two formats:
+    1. Label-only: Uses prompt_text + correct_label/incorrect_label to construct pairs
+    2. CoT (Chain-of-Thought): Uses chosen_full/rejected_full columns directly
+
+    The format is auto-detected based on column presence.
+    """
 
     def __init__(self, dataframe: pd.DataFrame, tokenizer, max_length: int = 256):
         self.data = dataframe.reset_index(drop=True)
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.has_error_types = 'error_type' in self.data.columns
+        # Auto-detect CoT format by checking for chosen_full/rejected_full columns
+        self.use_cot = 'chosen_full' in self.data.columns and 'rejected_full' in self.data.columns
         if self.has_error_types:
             self.error_types = self.data['error_type'].tolist()
         else:
@@ -343,8 +415,15 @@ class PairwiseRewardDataset(Dataset):
     def __getitem__(self, idx):
         row = self.data.iloc[idx]
 
-        preferred_text = f"{row['prompt_text']}\n\nChosen option: {row['correct_label']}"
-        rejected_text = f"{row['prompt_text']}\n\nChosen option: {row['incorrect_label']}"
+        if self.use_cot:
+            # CoT format: use full chain-of-thought responses
+            # Format: "{prompt}\n\n{cot_response}" where cot_response includes <think> tags
+            preferred_text = f"{row['prompt_text']}\n\n{row['chosen_full']}"
+            rejected_text = f"{row['prompt_text']}\n\n{row['rejected_full']}"
+        else:
+            # Label-only format: construct from prompt + label
+            preferred_text = f"{row['prompt_text']}\n\nChosen option: {row['correct_label']}"
+            rejected_text = f"{row['prompt_text']}\n\nChosen option: {row['incorrect_label']}"
 
         preferred_encoding = self.tokenizer(
             preferred_text, truncation=True, padding='max_length',
@@ -387,7 +466,7 @@ class RewardModel(nn.Module):
         print(f"Loading base model: {model_name}")
         self.backbone = AutoModel.from_pretrained(
             model_name,
-            torch_dtype=torch.float16,
+            dtype=torch.float16,
             device_map="auto",
         )
 
@@ -525,30 +604,52 @@ def train_single_run(config: SweepConfig, output_dir: str, device: torch.device)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    # Determine which data file and max_length to use based on CoT setting
+    if config.use_cot:
+        train_data_file = COT_TRAIN_DATA_FILE
+        train_max_length = config.cot_max_length
+        print(f"  Using CoT training data: {train_data_file}")
+        print(f"  CoT max_length: {train_max_length}")
+    else:
+        train_data_file = TRAIN_DATA_FILE
+        train_max_length = config.max_length
+
     # Load data with train/in-dist-val split
     train_ids, in_dist_val_ids = get_train_val_situation_split(
-        TRAIN_DATA_FILE,
+        train_data_file,
         val_fraction=config.in_dist_val_split,
         random_seed=config.random_seed
     )
 
-    # Load datasets
-    train_loader = TrainingDataLoader(
-        TRAIN_DATA_FILE, epoch=0, random_seed=config.random_seed, situation_ids=train_ids
-    )
+    # Load datasets based on CoT setting
+    if config.use_cot:
+        train_loader = CoTTrainingDataLoader(
+            train_data_file, random_seed=config.random_seed, situation_ids=train_ids
+        )
+    else:
+        train_loader = TrainingDataLoader(
+            train_data_file, epoch=0, random_seed=config.random_seed, situation_ids=train_ids
+        )
     train_df = train_loader.load_and_process_data()
 
-    in_dist_val_loader = InDistributionValidationDataLoader(
-        TRAIN_DATA_FILE, random_seed=config.random_seed, situation_ids=in_dist_val_ids
-    )
+    # In-dist validation uses same data source as training
+    if config.use_cot:
+        in_dist_val_loader = CoTTrainingDataLoader(
+            train_data_file, random_seed=config.random_seed, situation_ids=in_dist_val_ids
+        )
+    else:
+        in_dist_val_loader = InDistributionValidationDataLoader(
+            train_data_file, random_seed=config.random_seed, situation_ids=in_dist_val_ids
+        )
     in_dist_val_df = in_dist_val_loader.load_and_process_data()
 
+    # Out-dist validation always uses label-only format (cooperate labels)
     out_dist_val_loader = ValidationDataLoader(VAL_DATA_FILE, random_seed=config.random_seed)
     out_dist_val_df = out_dist_val_loader.load_and_process_data()
 
-    # Create datasets
-    train_dataset = PairwiseRewardDataset(train_df, tokenizer, max_length=config.max_length)
-    in_dist_val_dataset = PairwiseRewardDataset(in_dist_val_df, tokenizer, max_length=config.max_length)
+    # Create datasets with appropriate max_length
+    train_dataset = PairwiseRewardDataset(train_df, tokenizer, max_length=train_max_length)
+    in_dist_val_dataset = PairwiseRewardDataset(in_dist_val_df, tokenizer, max_length=train_max_length)
     out_dist_val_dataset = PairwiseRewardDataset(out_dist_val_df, tokenizer, max_length=config.max_length)
 
     print(f"  Training samples: {len(train_dataset)}")
@@ -596,12 +697,13 @@ def train_single_run(config: SweepConfig, output_dir: str, device: torch.device)
         print(f"\nEpoch {epoch + 1}/{config.num_epochs}")
 
         # Recreate training dataset with epoch-specific randomization
-        if epoch > 0:
+        # Note: CoT data is pre-generated so no per-epoch randomization needed
+        if epoch > 0 and not config.use_cot:
             train_loader = TrainingDataLoader(
-                TRAIN_DATA_FILE, epoch=epoch, random_seed=config.random_seed, situation_ids=train_ids
+                train_data_file, epoch=epoch, random_seed=config.random_seed, situation_ids=train_ids
             )
             train_df = train_loader.load_and_process_data()
-            train_dataset = PairwiseRewardDataset(train_df, tokenizer, max_length=config.max_length)
+            train_dataset = PairwiseRewardDataset(train_df, tokenizer, max_length=train_max_length)
 
         train_dataloader = DataLoader(
             train_dataset, batch_size=config.batch_size, shuffle=True,
