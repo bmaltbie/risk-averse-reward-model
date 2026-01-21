@@ -27,7 +27,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
-from transformers import AutoTokenizer, AutoModel
+from transformers import AutoTokenizer, AutoModel, get_cosine_schedule_with_warmup
 from peft import LoraConfig, get_peft_model, TaskType
 from sklearn.model_selection import train_test_split
 import matplotlib.pyplot as plt
@@ -57,6 +57,10 @@ class SweepConfig:
     # CoT training options
     use_cot: bool = True
     cot_max_length: int = 1024  # Reduced for memory efficiency (actual usage ~515 tokens)
+    # Learning rate scheduler
+    use_lr_scheduler: bool = True
+    warmup_ratio: float = 0.05  # 5% of total steps for warmup
+    min_lr_ratio: float = 0.1   # Decay to 10% of max LR (not all the way to 0)
 
 
 # Default sweep configurations
@@ -675,6 +679,23 @@ def train_single_run(config: SweepConfig, output_dir: str, device: torch.device)
         {'params': model.reward_head.parameters(), 'lr': config.learning_rate * 2.5},
     ], weight_decay=config.weight_decay)
 
+    # Calculate total training steps for scheduler
+    num_train_examples = len(train_dataset)
+    steps_per_epoch = (num_train_examples + config.batch_size - 1) // config.batch_size
+    effective_steps_per_epoch = (steps_per_epoch + config.gradient_accumulation_steps - 1) // config.gradient_accumulation_steps
+    total_training_steps = effective_steps_per_epoch * config.num_epochs
+
+    # Create learning rate scheduler (cosine with warmup)
+    scheduler = None
+    if config.use_lr_scheduler:
+        warmup_steps = int(config.warmup_ratio * total_training_steps)
+        scheduler = get_cosine_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=warmup_steps,
+            num_training_steps=total_training_steps,
+        )
+        print(f"\nLR Scheduler: cosine with {warmup_steps} warmup steps, {total_training_steps} total steps")
+
     # Baseline evaluation
     print("\nBaseline evaluation...")
     baseline_out = evaluate_model(model, out_dist_val_dataset, device)
@@ -741,6 +762,8 @@ def train_single_run(config: SweepConfig, output_dir: str, device: torch.device)
 
             if is_accumulation_complete or is_last_batch:
                 optimizer.step()
+                if scheduler is not None:
+                    scheduler.step()
 
         avg_train_loss = epoch_loss / num_batches
 
