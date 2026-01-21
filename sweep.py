@@ -61,6 +61,9 @@ class SweepConfig:
     use_lr_scheduler: bool = True
     warmup_ratio: float = 0.05  # 5% of total steps for warmup
     min_lr_ratio: float = 0.1   # Decay to 10% of max LR (not all the way to 0)
+    # Gradient clipping
+    use_gradient_clipping: bool = True
+    max_grad_norm: float = 1.0  # Standard default for LLM training
 
 
 # Default sweep configurations
@@ -696,6 +699,9 @@ def train_single_run(config: SweepConfig, output_dir: str, device: torch.device)
         )
         print(f"\nLR Scheduler: cosine with {warmup_steps} warmup steps, {total_training_steps} total steps")
 
+    if config.use_gradient_clipping:
+        print(f"Gradient Clipping: max_norm={config.max_grad_norm}")
+
     # Baseline evaluation
     print("\nBaseline evaluation...")
     baseline_out = evaluate_model(model, out_dist_val_dataset, device)
@@ -761,6 +767,8 @@ def train_single_run(config: SweepConfig, output_dir: str, device: torch.device)
             is_last_batch = (step + 1) == num_batches
 
             if is_accumulation_complete or is_last_batch:
+                if config.use_gradient_clipping:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
                 optimizer.step()
                 if scheduler is not None:
                     scheduler.step()
