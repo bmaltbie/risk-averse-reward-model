@@ -779,10 +779,15 @@ def train_single_run(config: SweepConfig, output_dir: str, device: torch.device)
         'in_dist_val_accuracy': [],
         'out_dist_val_accuracy': [],
         'epochs': [],
+        # Reference model tracking
+        'trained_pref_reward_mean': [],
+        'trained_rej_reward_mean': [],
+        'reference_pref_reward_mean': [],
+        'reference_rej_reward_mean': [],
+        'reward_divergence': [],  # |trained_margin - reference_margin|
     }
 
     best_val_accuracy = 0.0
-    epoch_kl_loss = 0.0  # Track KL loss per epoch
 
     # Training loop
     for epoch in range(config.num_epochs):
@@ -805,6 +810,10 @@ def train_single_run(config: SweepConfig, output_dir: str, device: torch.device)
         model.train()
         epoch_loss = 0.0
         epoch_kl_loss = 0.0
+        epoch_trained_pref = []
+        epoch_trained_rej = []
+        epoch_ref_pref = []
+        epoch_ref_rej = []
         num_batches = len(train_dataloader)
 
         for step, batch in enumerate(train_dataloader):
@@ -827,6 +836,10 @@ def train_single_run(config: SweepConfig, output_dir: str, device: torch.device)
 
             loss = bradley_terry_loss(preferred_rewards, rejected_rewards)
 
+            # Track trained rewards for visualization
+            epoch_trained_pref.extend(preferred_rewards.detach().cpu().tolist())
+            epoch_trained_rej.extend(rejected_rewards.detach().cpu().tolist())
+
             # Add KL regularization if reference model is enabled
             kl_loss = torch.tensor(0.0, device=device)
             if reference_reward_head is not None and config.reference_kl_beta > 0:
@@ -838,6 +851,10 @@ def train_single_run(config: SweepConfig, output_dir: str, device: torch.device)
                     model.backbone, reference_reward_head,
                     rejected_input_ids, rejected_attention_mask
                 )
+                # Track reference rewards for visualization
+                epoch_ref_pref.extend(ref_pref_rewards.detach().cpu().tolist())
+                epoch_ref_rej.extend(ref_rej_rewards.detach().cpu().tolist())
+
                 kl_loss = compute_reward_kl(
                     preferred_rewards, rejected_rewards,
                     ref_pref_rewards, ref_rej_rewards
@@ -881,6 +898,26 @@ def train_single_run(config: SweepConfig, output_dir: str, device: torch.device)
         history['in_dist_val_accuracy'].append(in_dist_eval['accuracy'])
         history['out_dist_val_accuracy'].append(out_dist_eval['accuracy'])
         history['epochs'].append(epoch + 1)
+
+        # Track reward statistics for visualization
+        trained_pref_mean = np.mean(epoch_trained_pref) if epoch_trained_pref else 0.0
+        trained_rej_mean = np.mean(epoch_trained_rej) if epoch_trained_rej else 0.0
+        history['trained_pref_reward_mean'].append(trained_pref_mean)
+        history['trained_rej_reward_mean'].append(trained_rej_mean)
+
+        if epoch_ref_pref:
+            ref_pref_mean = np.mean(epoch_ref_pref)
+            ref_rej_mean = np.mean(epoch_ref_rej)
+            trained_margin = trained_pref_mean - trained_rej_mean
+            ref_margin = ref_pref_mean - ref_rej_mean
+            divergence = abs(trained_margin - ref_margin)
+        else:
+            ref_pref_mean = 0.0
+            ref_rej_mean = 0.0
+            divergence = 0.0
+        history['reference_pref_reward_mean'].append(ref_pref_mean)
+        history['reference_rej_reward_mean'].append(ref_rej_mean)
+        history['reward_divergence'].append(divergence)
 
         if out_dist_eval['accuracy'] > best_val_accuracy:
             best_val_accuracy = out_dist_eval['accuracy']
