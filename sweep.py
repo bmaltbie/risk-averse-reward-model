@@ -64,6 +64,9 @@ class SweepConfig:
     # Gradient clipping
     use_gradient_clipping: bool = True
     max_grad_norm: float = 1.0  # Standard default for LLM training
+    # Reference model for KL regularization
+    use_reference_model: bool = True
+    reference_kl_beta: float = 0.1  # KL penalty weight (0 = monitoring only)
 
 
 # Default sweep configurations
@@ -530,6 +533,44 @@ def bradley_terry_loss(preferred_rewards, rejected_rewards):
     return -torch.log(torch.sigmoid(preferred_rewards - rejected_rewards)).mean()
 
 
+def compute_reward_kl(pref, rej, ref_pref, ref_rej):
+    """Compute KL divergence between trained and reference reward distributions.
+
+    Treats the pair of rewards as a 2-class distribution and computes
+    KL(trained || reference) to penalize divergence from the reference.
+    """
+    # Stack rewards into logits for 2-class distribution
+    trained_logits = torch.stack([pref, rej], dim=-1)
+    ref_logits = torch.stack([ref_pref, ref_rej], dim=-1)
+
+    # KL(trained || reference)
+    trained_log_probs = F.log_softmax(trained_logits, dim=-1)
+    ref_probs = F.softmax(ref_logits, dim=-1)
+
+    return F.kl_div(trained_log_probs, ref_probs, reduction='batchmean')
+
+
+def compute_reference_rewards(backbone, reference_head, input_ids, attention_mask):
+    """Compute rewards using frozen reference head.
+
+    Uses the same backbone but a frozen copy of the initial reward head
+    to compute reference rewards for KL regularization.
+    """
+    with torch.no_grad():
+        outputs = backbone(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            return_dict=True,
+        )
+        sequence_lengths = attention_mask.sum(dim=1) - 1
+        batch_size = input_ids.shape[0]
+        last_hidden_states = outputs.last_hidden_state[
+            torch.arange(batch_size, device=outputs.last_hidden_state.device),
+            sequence_lengths
+        ].float()
+        return reference_head(last_hidden_states).squeeze(-1)
+
+
 def evaluate_model(model, dataset, device, batch_size=4):
     """Evaluate model on pairwise accuracy."""
     model.eval()
@@ -675,6 +716,18 @@ def train_single_run(config: SweepConfig, output_dir: str, device: torch.device)
     # Ensure reward head is on device and fp32
     model.reward_head = model.reward_head.to(device).float()
 
+    # Create frozen reference head for KL regularization
+    reference_reward_head = None
+    if config.use_reference_model:
+        hidden_size = model.backbone.config.hidden_size
+        reference_reward_head = nn.Linear(hidden_size, 1, bias=True)
+        reference_reward_head.load_state_dict(model.reward_head.state_dict())
+        reference_reward_head = reference_reward_head.to(device).float()
+        reference_reward_head.eval()
+        for param in reference_reward_head.parameters():
+            param.requires_grad = False
+        print(f"Reference reward head created (frozen, {sum(p.numel() for p in reference_reward_head.parameters())} params)")
+
     # Create optimizer with parameter groups
     lora_params = [p for n, p in model.backbone.named_parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW([
@@ -702,6 +755,9 @@ def train_single_run(config: SweepConfig, output_dir: str, device: torch.device)
     if config.use_gradient_clipping:
         print(f"Gradient Clipping: max_norm={config.max_grad_norm}")
 
+    if config.use_reference_model:
+        print(f"Reference Model: KL beta={config.reference_kl_beta}")
+
     # Baseline evaluation
     print("\nBaseline evaluation...")
     baseline_out = evaluate_model(model, out_dist_val_dataset, device)
@@ -712,12 +768,14 @@ def train_single_run(config: SweepConfig, output_dir: str, device: torch.device)
     # Training history
     history = {
         'train_loss': [],
+        'kl_loss': [],
         'in_dist_val_accuracy': [],
         'out_dist_val_accuracy': [],
         'epochs': [],
     }
 
     best_val_accuracy = 0.0
+    epoch_kl_loss = 0.0  # Track KL loss per epoch
 
     # Training loop
     for epoch in range(config.num_epochs):
@@ -739,22 +797,47 @@ def train_single_run(config: SweepConfig, output_dir: str, device: torch.device)
 
         model.train()
         epoch_loss = 0.0
+        epoch_kl_loss = 0.0
         num_batches = len(train_dataloader)
 
         for step, batch in enumerate(train_dataloader):
             if step % config.gradient_accumulation_steps == 0:
                 optimizer.zero_grad()
 
+            preferred_input_ids = batch['preferred_input_ids'].to(device)
+            preferred_attention_mask = batch['preferred_attention_mask'].to(device)
+            rejected_input_ids = batch['rejected_input_ids'].to(device)
+            rejected_attention_mask = batch['rejected_attention_mask'].to(device)
+
             preferred_rewards = model(
-                input_ids=batch['preferred_input_ids'].to(device),
-                attention_mask=batch['preferred_attention_mask'].to(device)
+                input_ids=preferred_input_ids,
+                attention_mask=preferred_attention_mask
             )
             rejected_rewards = model(
-                input_ids=batch['rejected_input_ids'].to(device),
-                attention_mask=batch['rejected_attention_mask'].to(device)
+                input_ids=rejected_input_ids,
+                attention_mask=rejected_attention_mask
             )
 
             loss = bradley_terry_loss(preferred_rewards, rejected_rewards)
+
+            # Add KL regularization if reference model is enabled
+            kl_loss = torch.tensor(0.0, device=device)
+            if reference_reward_head is not None and config.reference_kl_beta > 0:
+                ref_pref_rewards = compute_reference_rewards(
+                    model.backbone, reference_reward_head,
+                    preferred_input_ids, preferred_attention_mask
+                )
+                ref_rej_rewards = compute_reference_rewards(
+                    model.backbone, reference_reward_head,
+                    rejected_input_ids, rejected_attention_mask
+                )
+                kl_loss = compute_reward_kl(
+                    preferred_rewards, rejected_rewards,
+                    ref_pref_rewards, ref_rej_rewards
+                )
+                loss = loss + config.reference_kl_beta * kl_loss
+                epoch_kl_loss += kl_loss.item()
+
             scaled_loss = loss / config.gradient_accumulation_steps
 
             if torch.isnan(loss):
@@ -774,16 +857,20 @@ def train_single_run(config: SweepConfig, output_dir: str, device: torch.device)
                     scheduler.step()
 
         avg_train_loss = epoch_loss / num_batches
+        avg_kl_loss = epoch_kl_loss / num_batches if epoch_kl_loss > 0 else 0.0
 
         # Validation
         in_dist_eval = evaluate_model(model, in_dist_val_dataset, device)
         out_dist_eval = evaluate_model(model, out_dist_val_dataset, device)
 
         print(f"  Loss: {avg_train_loss:.4f}")
+        if config.use_reference_model and config.reference_kl_beta > 0:
+            print(f"  KL Loss: {avg_kl_loss:.4f}")
         print(f"  In-dist accuracy: {in_dist_eval['accuracy']:.4f}")
         print(f"  Out-dist accuracy: {out_dist_eval['accuracy']:.4f}")
 
         history['train_loss'].append(avg_train_loss)
+        history['kl_loss'].append(avg_kl_loss)
         history['in_dist_val_accuracy'].append(in_dist_eval['accuracy'])
         history['out_dist_val_accuracy'].append(out_dist_eval['accuracy'])
         history['epochs'].append(epoch + 1)
