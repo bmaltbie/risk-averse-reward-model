@@ -47,7 +47,7 @@ class SweepConfig:
     lora_target_modules: List[str] = field(default_factory=lambda: ["q_proj", "v_proj"])
     # Fixed params
     model_name: str = "Qwen/Qwen3-8B"
-    batch_size: int = 1
+    batch_size: int = 8
     gradient_accumulation_steps: int = 8
     num_epochs: int = 10
     weight_decay: float = 0.01
