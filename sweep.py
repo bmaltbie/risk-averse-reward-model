@@ -41,6 +41,7 @@ class SweepConfig:
     """Configuration for a single training run."""
     name: str
     learning_rate: float = 2e-4
+    reward_head_lr_multiplier: float = 2.5  # Reward head LR = learning_rate * this
     lora_r: int = 8
     lora_alpha: int = 16
     lora_dropout: float = 0.05
@@ -82,6 +83,10 @@ SWEEP_CONFIGS = [
     SweepConfig(name="cot_lr_5e-4", learning_rate=5e-4),
     SweepConfig(name="cot_lora_r4", lora_r=4, lora_alpha=8),
     SweepConfig(name="cot_lora_r16", lora_r=16, lora_alpha=32),
+    # Reward head LR multiplier ablation
+    SweepConfig(name="head_mult_1.0x", reward_head_lr_multiplier=1.0),
+    SweepConfig(name="head_mult_2.0x", reward_head_lr_multiplier=2.0),
+    SweepConfig(name="head_mult_5.0x", reward_head_lr_multiplier=5.0),
 ]
 
 # Data file paths
@@ -730,10 +735,12 @@ def train_single_run(config: SweepConfig, output_dir: str, device: torch.device)
 
     # Create optimizer with parameter groups
     lora_params = [p for n, p in model.backbone.named_parameters() if p.requires_grad]
+    reward_head_lr = config.learning_rate * config.reward_head_lr_multiplier
     optimizer = torch.optim.AdamW([
         {'params': lora_params, 'lr': config.learning_rate},
-        {'params': model.reward_head.parameters(), 'lr': config.learning_rate * 2.5},
+        {'params': model.reward_head.parameters(), 'lr': reward_head_lr},
     ], weight_decay=config.weight_decay)
+    print(f"Optimizer: LoRA LR={config.learning_rate}, Reward Head LR={reward_head_lr} ({config.reward_head_lr_multiplier}x)")
 
     # Calculate total training steps for scheduler
     num_train_examples = len(train_dataset)
