@@ -118,9 +118,37 @@ DEFAULT_OUTPUT_DIR = "outputs/sweeps"
 # ============================================================
 # DATA LOADING
 # ============================================================
+# Schema mapping between training and validation data:
+#
+# Training data (CARA labels — risk-aversion):
+#   correct = CARA_correct_labels (risk-averse choice)
+#   incorrect = CARA_alpha_0_10_best_labels | linear_best_labels (based on low_bucket_label)
+#   Loaded by: TrainingDataLoader, InDistributionValidationDataLoader
+#
+# CoT training data (pre-generated chain-of-thought):
+#   correct = chosen_full (CoT response with CARA utility → risk-averse answer)
+#   incorrect = rejected_full (CoT response with wrong utility function)
+#   Loaded by: CoTTrainingDataLoader
+#
+# Validation data (cooperate labels — out-of-distribution):
+#   correct = cooperate_correct_labels (cooperative choice)
+#   incorrect = cooperate_incorrect_labels (non-cooperative choice)
+#   Loaded by: ValidationDataLoader
+#
+# Error type classification (why the incorrect option is wrong):
+#   too_risky:        preferred by linear (risk-neutral) agent
+#   too_risk_averse:  preferred by CARA alpha=0.10 (overly cautious) agent
+#   other:            neither pattern
+
+
 def get_train_val_situation_split(csv_file_path: str, val_fraction: float = 0.10, random_seed: int = 42):
     """Split situation IDs into train and validation sets, stratified by low_bucket_label."""
     df = pd.read_csv(csv_file_path)
+    if 'situation_id' not in df.columns:
+        raise ValueError(
+            f"Missing required column 'situation_id' in '{csv_file_path}'. "
+            f"Available: {list(df.columns)}"
+        )
     situations = df.groupby('situation_id').first().reset_index()
     situation_ids = situations['situation_id'].tolist()
 
@@ -162,7 +190,23 @@ class TrainingDataLoader:
         self.situation_ids = situation_ids
 
     def load_and_process_data(self) -> pd.DataFrame:
+        if not os.path.exists(self.csv_file_path):
+            raise FileNotFoundError(f"Training data file not found: '{self.csv_file_path}'")
         df = pd.read_csv(self.csv_file_path)
+
+        required_columns = ['situation_id', 'prompt_text', 'CARA_correct_labels', 'low_bucket_label']
+        missing = [c for c in required_columns if c not in df.columns]
+        if missing:
+            raise ValueError(
+                f"Missing required columns in training data '{self.csv_file_path}': {missing}. "
+                f"Available: {list(df.columns)}"
+            )
+        conditional_columns = ['CARA_alpha_0_10_best_labels', 'linear_best_labels']
+        missing_conditional = [c for c in conditional_columns if c not in df.columns]
+        if missing_conditional:
+            print(f"  Note: Conditional columns not present: {missing_conditional}. "
+                  f"Rows with matching low_bucket_labels will be skipped.")
+
         situations = df.groupby('situation_id').first().reset_index()
 
         if self.situation_ids is not None:
@@ -204,7 +248,7 @@ class TrainingDataLoader:
                     'incorrect_label': incorrect_label,
                     'low_bucket_label': low_bucket,
                 })
-            except (json.JSONDecodeError, KeyError) as e:
+            except (json.JSONDecodeError, KeyError, TypeError, AttributeError) as e:
                 skipped += 1
                 continue
 
@@ -231,7 +275,17 @@ class CoTTrainingDataLoader:
         self.situation_ids = situation_ids
 
     def load_and_process_data(self) -> pd.DataFrame:
+        if not os.path.exists(self.csv_file_path):
+            raise FileNotFoundError(f"CoT training data file not found: '{self.csv_file_path}'")
         df = pd.read_csv(self.csv_file_path)
+
+        required_columns = ['situation_id', 'prompt_text', 'chosen_full', 'rejected_full']
+        missing = [c for c in required_columns if c not in df.columns]
+        if missing:
+            raise ValueError(
+                f"Missing required columns in CoT data '{self.csv_file_path}': {missing}. "
+                f"Available: {list(df.columns)}"
+            )
 
         if self.situation_ids is not None:
             df = df[df['situation_id'].isin(self.situation_ids)]
@@ -252,11 +306,17 @@ class CoTTrainingDataLoader:
                 else:
                     error_type = 'other'
 
+                # Skip rows with NaN in critical CoT fields
+                chosen = row['chosen_full']
+                rejected = row['rejected_full']
+                if pd.isna(chosen) or pd.isna(rejected):
+                    continue
+
                 processed.append({
                     'situation_id': row['situation_id'],
                     'prompt_text': row['prompt_text'],
-                    'chosen_full': row['chosen_full'],
-                    'rejected_full': row['rejected_full'],
+                    'chosen_full': chosen,
+                    'rejected_full': rejected,
                     'correct_label': row.get('chosen_answer', ''),
                     'incorrect_label': row.get('rejected_answer', ''),
                     'error_type': error_type,
@@ -278,7 +338,23 @@ class InDistributionValidationDataLoader:
         self.situation_ids = situation_ids
 
     def load_and_process_data(self) -> pd.DataFrame:
+        if not os.path.exists(self.csv_file_path):
+            raise FileNotFoundError(f"In-distribution validation data file not found: '{self.csv_file_path}'")
         df = pd.read_csv(self.csv_file_path)
+
+        required_columns = ['situation_id', 'prompt_text', 'CARA_correct_labels', 'low_bucket_label']
+        missing = [c for c in required_columns if c not in df.columns]
+        if missing:
+            raise ValueError(
+                f"Missing required columns in in-dist validation data '{self.csv_file_path}': {missing}. "
+                f"Available: {list(df.columns)}"
+            )
+        conditional_columns = ['CARA_alpha_0_10_best_labels', 'linear_best_labels']
+        missing_conditional = [c for c in conditional_columns if c not in df.columns]
+        if missing_conditional:
+            print(f"  Note: Conditional columns not present: {missing_conditional}. "
+                  f"Rows with matching low_bucket_labels will be skipped.")
+
         situations = df.groupby('situation_id').first().reset_index()
 
         if self.situation_ids is not None:
@@ -326,7 +402,7 @@ class InDistributionValidationDataLoader:
                     'error_type': error_type,
                     'low_bucket_label': low_bucket,
                 })
-            except (json.JSONDecodeError, KeyError) as e:
+            except (json.JSONDecodeError, KeyError, TypeError, AttributeError) as e:
                 skipped += 1
                 continue
 
@@ -350,8 +426,19 @@ class ValidationDataLoader:
         self.rng = np.random.default_rng(random_seed)
 
     def load_and_process_data(self) -> pd.DataFrame:
+        if not os.path.exists(self.csv_file_path):
+            raise FileNotFoundError(f"Validation data file not found: '{self.csv_file_path}'")
         df = pd.read_csv(self.csv_file_path)
         df = df.dropna(how='all')
+
+        required_columns = ['situation_id', 'prompt_text', 'cooperate_correct_labels',
+                            'cooperate_incorrect_labels', 'option_index']
+        missing = [c for c in required_columns if c not in df.columns]
+        if missing:
+            raise ValueError(
+                f"Missing required columns in validation data '{self.csv_file_path}': {missing}. "
+                f"Available: {list(df.columns)}"
+            )
 
         # Build option properties lookup
         option_properties = {}
@@ -424,7 +511,7 @@ class ValidationDataLoader:
                     'incorrect_label': incorrect_label,
                     'error_type': error_type,
                 })
-            except (json.JSONDecodeError, KeyError) as e:
+            except (json.JSONDecodeError, KeyError, TypeError, AttributeError) as e:
                 skipped += 1
                 continue
 
@@ -617,14 +704,22 @@ def evaluate_model(model, dataset, device, batch_size=4):
 
     with torch.no_grad():
         for batch in dataloader:
-            preferred_rewards = model(
-                input_ids=batch['preferred_input_ids'].to(device),
-                attention_mask=batch['preferred_attention_mask'].to(device)
-            )
-            rejected_rewards = model(
-                input_ids=batch['rejected_input_ids'].to(device),
-                attention_mask=batch['rejected_attention_mask'].to(device)
-            )
+            try:
+                preferred_rewards = model(
+                    input_ids=batch['preferred_input_ids'].to(device),
+                    attention_mask=batch['preferred_attention_mask'].to(device)
+                )
+                rejected_rewards = model(
+                    input_ids=batch['rejected_input_ids'].to(device),
+                    attention_mask=batch['rejected_attention_mask'].to(device)
+                )
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower():
+                    print(f"  WARNING: GPU OOM during evaluation. Clearing cache and skipping batch.")
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    continue
+                raise
 
             loss = bradley_terry_loss(preferred_rewards, rejected_rewards)
             total_loss += loss.item() * len(preferred_rewards)
@@ -721,6 +816,8 @@ def train_single_run(config: SweepConfig, output_dir: str, device: torch.device)
             train_data_file, epoch=0, random_seed=config.random_seed, situation_ids=train_ids
         )
     train_df = train_loader.load_and_process_data()
+    if train_df.empty:
+        raise ValueError(f"Training data is empty after processing '{train_data_file}'. Check data file and filters.")
 
     # In-dist validation uses same data source as training
     if config.use_cot:
@@ -732,10 +829,14 @@ def train_single_run(config: SweepConfig, output_dir: str, device: torch.device)
             train_data_file, random_seed=config.random_seed, situation_ids=in_dist_val_ids
         )
     in_dist_val_df = in_dist_val_loader.load_and_process_data()
+    if in_dist_val_df.empty:
+        raise ValueError(f"In-distribution validation data is empty after processing. Check data file and situation ID split.")
 
     # Out-dist validation always uses label-only format (cooperate labels)
     out_dist_val_loader = ValidationDataLoader(VAL_DATA_FILE, random_seed=config.random_seed)
     out_dist_val_df = out_dist_val_loader.load_and_process_data()
+    if out_dist_val_df.empty:
+        raise ValueError(f"Out-of-distribution validation data is empty after processing '{VAL_DATA_FILE}'. Check data file.")
 
     # Create datasets with appropriate max_length
     train_dataset = PairwiseRewardDataset(train_df, tokenizer, max_length=train_max_length)
@@ -857,77 +958,92 @@ def train_single_run(config: SweepConfig, output_dir: str, device: torch.device)
         num_batches = len(train_dataloader)
 
         optimizer.zero_grad()
+        oom_encountered = False
         for step, batch in enumerate(train_dataloader):
-            preferred_input_ids = batch['preferred_input_ids'].to(device)
-            preferred_attention_mask = batch['preferred_attention_mask'].to(device)
-            rejected_input_ids = batch['rejected_input_ids'].to(device)
-            rejected_attention_mask = batch['rejected_attention_mask'].to(device)
+            try:
+                preferred_input_ids = batch['preferred_input_ids'].to(device)
+                preferred_attention_mask = batch['preferred_attention_mask'].to(device)
+                rejected_input_ids = batch['rejected_input_ids'].to(device)
+                rejected_attention_mask = batch['rejected_attention_mask'].to(device)
 
-            # Use return_hidden when we need reference rewards to avoid redundant backbone pass
-            need_hidden = reference_reward_head is not None and config.reference_kl_beta > 0
-            if need_hidden:
-                preferred_rewards, pref_hidden = model(
-                    input_ids=preferred_input_ids,
-                    attention_mask=preferred_attention_mask,
-                    return_hidden=True
-                )
-                rejected_rewards, rej_hidden = model(
-                    input_ids=rejected_input_ids,
-                    attention_mask=rejected_attention_mask,
-                    return_hidden=True
-                )
-            else:
-                preferred_rewards = model(
-                    input_ids=preferred_input_ids,
-                    attention_mask=preferred_attention_mask
-                )
-                rejected_rewards = model(
-                    input_ids=rejected_input_ids,
-                    attention_mask=rejected_attention_mask
-                )
+                # Use return_hidden when we need reference rewards to avoid redundant backbone pass
+                need_hidden = reference_reward_head is not None and config.reference_kl_beta > 0
+                if need_hidden:
+                    preferred_rewards, pref_hidden = model(
+                        input_ids=preferred_input_ids,
+                        attention_mask=preferred_attention_mask,
+                        return_hidden=True
+                    )
+                    rejected_rewards, rej_hidden = model(
+                        input_ids=rejected_input_ids,
+                        attention_mask=rejected_attention_mask,
+                        return_hidden=True
+                    )
+                else:
+                    preferred_rewards = model(
+                        input_ids=preferred_input_ids,
+                        attention_mask=preferred_attention_mask
+                    )
+                    rejected_rewards = model(
+                        input_ids=rejected_input_ids,
+                        attention_mask=rejected_attention_mask
+                    )
 
-            loss = bradley_terry_loss(preferred_rewards, rejected_rewards)
+                loss = bradley_terry_loss(preferred_rewards, rejected_rewards)
 
-            # Track trained rewards for visualization
-            epoch_trained_pref.extend(preferred_rewards.detach().cpu().tolist())
-            epoch_trained_rej.extend(rejected_rewards.detach().cpu().tolist())
+                # Add KL regularization if reference model is enabled
+                kl_loss = torch.tensor(0.0, device=device)
+                if need_hidden:
+                    ref_pref_rewards = compute_reference_rewards(reference_reward_head, pref_hidden)
+                    ref_rej_rewards = compute_reference_rewards(reference_reward_head, rej_hidden)
 
-            # Add KL regularization if reference model is enabled
-            kl_loss = torch.tensor(0.0, device=device)
-            if need_hidden:
-                ref_pref_rewards = compute_reference_rewards(reference_reward_head, pref_hidden)
-                ref_rej_rewards = compute_reference_rewards(reference_reward_head, rej_hidden)
-                # Track reference rewards for visualization
-                epoch_ref_pref.extend(ref_pref_rewards.detach().cpu().tolist())
-                epoch_ref_rej.extend(ref_rej_rewards.detach().cpu().tolist())
+                    kl_loss = compute_reward_kl(
+                        preferred_rewards, rejected_rewards,
+                        ref_pref_rewards, ref_rej_rewards
+                    )
+                    loss = loss + config.reference_kl_beta * kl_loss
 
-                kl_loss = compute_reward_kl(
-                    preferred_rewards, rejected_rewards,
-                    ref_pref_rewards, ref_rej_rewards
-                )
-                loss = loss + config.reference_kl_beta * kl_loss
+                scaled_loss = loss / config.gradient_accumulation_steps
+
+                if torch.isnan(loss):
+                    print(f"  WARNING: NaN loss at epoch {epoch+1}, step {step+1}. Zeroing gradients and skipping.")
+                    optimizer.zero_grad()
+                    continue
+
+                # Track rewards AFTER NaN check to avoid polluting history
+                epoch_trained_pref.extend(preferred_rewards.detach().cpu().tolist())
+                epoch_trained_rej.extend(rejected_rewards.detach().cpu().tolist())
                 epoch_kl_loss += kl_loss.item()
+                if need_hidden:
+                    epoch_ref_pref.extend(ref_pref_rewards.detach().cpu().tolist())
+                    epoch_ref_rej.extend(ref_rej_rewards.detach().cpu().tolist())
 
-            scaled_loss = loss / config.gradient_accumulation_steps
+                scaled_loss.backward()
+                epoch_loss += loss.item()
 
-            if torch.isnan(loss):
-                print(f"  WARNING: NaN loss at epoch {epoch+1}, step {step+1}. Zeroing gradients and skipping.")
-                optimizer.zero_grad()
-                continue
+                is_accumulation_complete = (step + 1) % config.gradient_accumulation_steps == 0
+                is_last_batch = (step + 1) == num_batches
 
-            scaled_loss.backward()
-            epoch_loss += loss.item()
+                if is_accumulation_complete or is_last_batch:
+                    if config.use_gradient_clipping:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
+                    optimizer.step()
+                    optimizer.zero_grad()
+                    if scheduler is not None:
+                        scheduler.step()
 
-            is_accumulation_complete = (step + 1) % config.gradient_accumulation_steps == 0
-            is_last_batch = (step + 1) == num_batches
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower():
+                    print(f"  WARNING: GPU OOM at epoch {epoch+1}, step {step+1}. Clearing cache and skipping batch.")
+                    optimizer.zero_grad()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    oom_encountered = True
+                    continue
+                raise
 
-            if is_accumulation_complete or is_last_batch:
-                if config.use_gradient_clipping:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
-                optimizer.step()
-                optimizer.zero_grad()
-                if scheduler is not None:
-                    scheduler.step()
+        if oom_encountered:
+            print(f"  Note: OOM occurred during epoch {epoch+1}. Consider reducing batch_size or max_length.")
 
         avg_train_loss = epoch_loss / num_batches
         avg_kl_loss = epoch_kl_loss / num_batches if epoch_kl_loss > 0 else 0.0
@@ -1010,6 +1126,12 @@ def train_single_run(config: SweepConfig, output_dir: str, device: torch.device)
             'train_samples': len(train_dataset),
             'in_dist_val_samples': len(in_dist_val_dataset),
             'out_dist_val_samples': len(out_dist_val_dataset),
+            'training_file': train_data_file,
+            'out_dist_validation_file': VAL_DATA_FILE,
+            'use_cot': config.use_cot,
+            'training_label_type': 'CARA CoT' if config.use_cot else 'CARA (risk-aversion)',
+            'in_dist_validation_label_type': 'CARA CoT' if config.use_cot else 'CARA (risk-aversion)',
+            'out_dist_validation_label_type': 'cooperate',
         }
     }
 
@@ -1076,7 +1198,15 @@ def run_sweep(configs: List[SweepConfig], output_base: str):
                 'baseline': {'out_dist_accuracy': 0.0, 'in_dist_accuracy': 0.0},
                 'improvement': {'out_dist_accuracy_gain': 0.0, 'in_dist_accuracy_gain': 0.0},
                 'training_time_minutes': 0.0,
-                'data': {'train_samples': 0, 'in_dist_val_samples': 0, 'out_dist_val_samples': 0},
+                'data': {
+                    'train_samples': 0, 'in_dist_val_samples': 0, 'out_dist_val_samples': 0,
+                    'training_file': COT_TRAIN_DATA_FILE if config.use_cot else TRAIN_DATA_FILE,
+                    'out_dist_validation_file': VAL_DATA_FILE,
+                    'use_cot': config.use_cot,
+                    'training_label_type': 'CARA CoT' if config.use_cot else 'CARA (risk-aversion)',
+                    'in_dist_validation_label_type': 'CARA CoT' if config.use_cot else 'CARA (risk-aversion)',
+                    'out_dist_validation_label_type': 'cooperate',
+                },
             })
 
     sweep_elapsed = time.time() - sweep_start
@@ -1118,10 +1248,18 @@ def generate_sweep_summary(results: List[dict], sweep_dir: str, total_time: floa
             'training_time_minutes': r['training_time_minutes'],
         })
 
+    # Extract data source info from first result
+    first_data = results[0].get('data', {})
     summary = {
         'sweep_timestamp': datetime.now().strftime("%Y%m%d_%H%M%S"),
         'total_runs': len(results),
         'total_time_minutes': total_time / 60,
+        'data_sources': {
+            'training_file': first_data.get('training_file', 'unknown'),
+            'out_dist_validation_file': first_data.get('out_dist_validation_file', 'unknown'),
+            'training_label_type': first_data.get('training_label_type', 'unknown'),
+            'out_dist_validation_label_type': first_data.get('out_dist_validation_label_type', 'unknown'),
+        },
         'best_config': {
             'name': runs_ranked[0]['name'],
             'out_dist_accuracy': runs_ranked[0]['out_dist_accuracy'],
@@ -1141,6 +1279,11 @@ def generate_sweep_summary(results: List[dict], sweep_dir: str, total_time: floa
     for r in runs_ranked:
         print(f"{r['rank']:<6} {r['name']:<15} {r['out_dist_accuracy']:>11.4f} {r['in_dist_accuracy']:>12.4f} {r['training_time_minutes']:>10.1f}")
     print(f"\nBest: {runs_ranked[0]['name']} with {runs_ranked[0]['out_dist_accuracy']:.4f} accuracy")
+
+    data_info = summary.get('data_sources', {})
+    print(f"\nData sources:")
+    print(f"  Training: {data_info.get('training_label_type', 'unknown')} ({os.path.basename(data_info.get('training_file', 'unknown'))})")
+    print(f"  Out-dist validation: {data_info.get('out_dist_validation_label_type', 'unknown')} ({os.path.basename(data_info.get('out_dist_validation_file', 'unknown'))})")
 
 
 def generate_comparison_plot(results: List[dict], sweep_dir: str):
@@ -1167,7 +1310,15 @@ def generate_comparison_plot(results: List[dict], sweep_dir: str):
 
     ax.set_xlabel('Configuration')
     ax.set_ylabel('Accuracy')
-    ax.set_title('Hyperparameter Sweep Results')
+    ax.set_title('Hyperparameter Sweep Results', fontsize=14, fontweight='bold')
+
+    # Add subtitle with label type info
+    first_data = results[0].get('data', {})
+    train_label = first_data.get('training_label_type', 'CARA')
+    val_label = first_data.get('out_dist_validation_label_type', 'cooperate')
+    ax.text(0.5, 1.02, f'Train: {train_label} | Out-dist Val: {val_label}',
+            transform=ax.transAxes, ha='center', fontsize=9, color='gray')
+
     ax.set_xticks(x)
     ax.set_xticklabels(names, rotation=45, ha='right')
     ax.legend()
@@ -1178,7 +1329,14 @@ def generate_comparison_plot(results: List[dict], sweep_dir: str):
         ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.01,
                 f'{val:.3f}', ha='center', va='bottom', fontsize=8)
 
-    plt.tight_layout()
+    # Add data file footer
+    train_file = os.path.basename(first_data.get('training_file', ''))
+    val_file = os.path.basename(first_data.get('out_dist_validation_file', ''))
+    if train_file or val_file:
+        fig.text(0.5, 0.01, f'Data: {train_file} / {val_file}',
+                 ha='center', fontsize=7, color='gray', style='italic')
+
+    plt.tight_layout(rect=[0, 0.03, 1, 1])
     plt.savefig(os.path.join(sweep_dir, 'sweep_comparison.png'), dpi=150)
     plt.close()
     print(f"\nComparison plot saved to: {sweep_dir}/sweep_comparison.png")
