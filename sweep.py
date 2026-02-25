@@ -24,13 +24,26 @@ from typing import List, Dict, Optional, Tuple
 
 import pandas as pd
 import numpy as np
+import random
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer, AutoModel, get_cosine_schedule_with_warmup
 from peft import LoraConfig, get_peft_model, TaskType
 from sklearn.model_selection import train_test_split
 import matplotlib.pyplot as plt
+
+
+def set_seed(seed: int):
+    """Set all seeds for reproducibility."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
 
 # ============================================================
@@ -61,13 +74,16 @@ class SweepConfig:
     # Learning rate scheduler
     use_lr_scheduler: bool = True
     warmup_ratio: float = 0.05  # 5% of total steps for warmup
-    min_lr_ratio: float = 0.1   # Decay to 10% of max LR (not all the way to 0)
     # Gradient clipping
     use_gradient_clipping: bool = True
     max_grad_norm: float = 1.0  # Standard default for LLM training
     # Reference model for KL regularization
     use_reference_model: bool = True
     reference_kl_beta: float = 0.1  # KL penalty weight (0 = monitoring only)
+    # Model initialization
+    reward_head_init_std: float = 0.01  # Std dev for reward head weight init
+    # Evaluation
+    eval_batch_size: int = 4  # Batch size for evaluation (no gradients, can be larger)
 
 
 # Default sweep configurations
@@ -96,6 +112,7 @@ COT_TRAIN_DATA_FILE = "data/2026_01_29_new_full_training_set_with_CoTs_Sonnet_4_
 VAL_DATA_FILE = "data/2026-01-29, New merged val set with Rebels and Steals.csv"
 # Legacy path (no longer exists, kept for reference)
 TRAIN_DATA_FILE = COT_TRAIN_DATA_FILE  # Fallback to CoT file
+DEFAULT_OUTPUT_DIR = "outputs/sweeps"
 
 
 # ============================================================
@@ -152,6 +169,7 @@ class TrainingDataLoader:
             situations = situations[situations['situation_id'].isin(self.situation_ids)]
 
         processed = []
+        skipped = 0
         for _, row in situations.iterrows():
             try:
                 prompt_text = row['prompt_text']
@@ -186,9 +204,12 @@ class TrainingDataLoader:
                     'incorrect_label': incorrect_label,
                     'low_bucket_label': low_bucket,
                 })
-            except (json.JSONDecodeError, KeyError):
+            except (json.JSONDecodeError, KeyError) as e:
+                skipped += 1
                 continue
 
+        if skipped > 0:
+            print(f"  Warning: Skipped {skipped} rows due to parsing errors")
         return pd.DataFrame(processed)
 
 
@@ -264,6 +285,7 @@ class InDistributionValidationDataLoader:
             situations = situations[situations['situation_id'].isin(self.situation_ids)]
 
         processed = []
+        skipped = 0
         for _, row in situations.iterrows():
             try:
                 prompt_text = row['prompt_text']
@@ -304,9 +326,12 @@ class InDistributionValidationDataLoader:
                     'error_type': error_type,
                     'low_bucket_label': low_bucket,
                 })
-            except (json.JSONDecodeError, KeyError):
+            except (json.JSONDecodeError, KeyError) as e:
+                skipped += 1
                 continue
 
+        if skipped > 0:
+            print(f"  Warning: Skipped {skipped} rows due to parsing errors")
         return pd.DataFrame(processed)
 
 
@@ -364,6 +389,7 @@ class ValidationDataLoader:
         situations = df.groupby('situation_id').first().reset_index()
 
         processed = []
+        skipped = 0
         for _, row in situations.iterrows():
             try:
                 sit_id = row['situation_id']
@@ -398,9 +424,12 @@ class ValidationDataLoader:
                     'incorrect_label': incorrect_label,
                     'error_type': error_type,
                 })
-            except (json.JSONDecodeError, KeyError):
+            except (json.JSONDecodeError, KeyError) as e:
+                skipped += 1
                 continue
 
+        if skipped > 0:
+            print(f"  Warning: Skipped {skipped} rows due to parsing errors")
         return pd.DataFrame(processed)
 
 
@@ -480,6 +509,7 @@ class RewardModel(nn.Module):
         lora_alpha: int = 16,
         lora_dropout: float = 0.05,
         lora_target_modules: list = None,
+        reward_head_init_std: float = 0.01,
     ):
         super().__init__()
 
@@ -492,7 +522,7 @@ class RewardModel(nn.Module):
 
         hidden_size = self.backbone.config.hidden_size
         self.reward_head = nn.Linear(hidden_size, 1, bias=True)
-        nn.init.normal_(self.reward_head.weight, mean=0.0, std=0.01)
+        nn.init.normal_(self.reward_head.weight, mean=0.0, std=reward_head_init_std)
         nn.init.zeros_(self.reward_head.bias)
 
         if lora_target_modules is None:
@@ -514,7 +544,8 @@ class RewardModel(nn.Module):
         total_params = sum(p.numel() for p in self.parameters())
         print(f"Total trainable: {trainable_params:,} / {total_params:,}")
 
-    def forward(self, input_ids, attention_mask):
+    def _extract_last_hidden(self, input_ids, attention_mask):
+        """Run backbone and extract last-token hidden states in fp32."""
         outputs = self.backbone(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -529,9 +560,14 @@ class RewardModel(nn.Module):
             sequence_lengths
         ]
 
-        last_hidden_states = last_hidden_states.float()
+        return last_hidden_states.float()
+
+    def forward(self, input_ids, attention_mask, return_hidden=False):
+        last_hidden_states = self._extract_last_hidden(input_ids, attention_mask)
         rewards = self.reward_head(last_hidden_states).squeeze(-1)
 
+        if return_hidden:
+            return rewards, last_hidden_states
         return rewards
 
 
@@ -540,7 +576,7 @@ class RewardModel(nn.Module):
 # ============================================================
 def bradley_terry_loss(preferred_rewards, rejected_rewards):
     """Compute Bradley-Terry pairwise ranking loss."""
-    return -torch.log(torch.sigmoid(preferred_rewards - rejected_rewards)).mean()
+    return -F.logsigmoid(preferred_rewards - rejected_rewards).mean()
 
 
 def compute_reward_kl(pref, rej, ref_pref, ref_rej):
@@ -560,25 +596,10 @@ def compute_reward_kl(pref, rej, ref_pref, ref_rej):
     return F.kl_div(trained_log_probs, ref_probs, reduction='batchmean')
 
 
-def compute_reference_rewards(backbone, reference_head, input_ids, attention_mask):
-    """Compute rewards using frozen reference head.
-
-    Uses the same backbone but a frozen copy of the initial reward head
-    to compute reference rewards for KL regularization.
-    """
+def compute_reference_rewards(reference_head, last_hidden_states):
+    """Compute rewards using frozen reference head from cached hidden states."""
     with torch.no_grad():
-        outputs = backbone(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            return_dict=True,
-        )
-        sequence_lengths = attention_mask.sum(dim=1) - 1
-        batch_size = input_ids.shape[0]
-        last_hidden_states = outputs.last_hidden_state[
-            torch.arange(batch_size, device=outputs.last_hidden_state.device),
-            sequence_lengths
-        ].float()
-        return reference_head(last_hidden_states).squeeze(-1)
+        return reference_head(last_hidden_states.detach()).squeeze(-1)
 
 
 def evaluate_model(model, dataset, device, batch_size=4):
@@ -634,6 +655,8 @@ def evaluate_model(model, dataset, device, batch_size=4):
                 'total': total_by_type[error_type],
             }
 
+    model.train()
+
     return {
         'accuracy': accuracy,
         'avg_loss': avg_loss,
@@ -648,6 +671,7 @@ def evaluate_model(model, dataset, device, batch_size=4):
 # ============================================================
 def train_single_run(config: SweepConfig, output_dir: str, device: torch.device) -> dict:
     """Run training with given config, return results dict."""
+    set_seed(config.random_seed)
     start_time = time.time()
     os.makedirs(output_dir, exist_ok=True)
 
@@ -656,6 +680,14 @@ def train_single_run(config: SweepConfig, output_dir: str, device: torch.device)
     print(f"  Learning rate: {config.learning_rate}")
     print(f"  LoRA rank: {config.lora_r}, alpha: {config.lora_alpha}")
     print(f"{'='*60}")
+
+    # Validate config
+    if not config.use_cot:
+        raise ValueError(
+            f"Label-only training is no longer supported. "
+            f"Config '{config.name}' has use_cot=False but the label-only training file no longer exists. "
+            f"Set use_cot=True or remove this config."
+        )
 
     # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(config.model_name)
@@ -721,6 +753,7 @@ def train_single_run(config: SweepConfig, output_dir: str, device: torch.device)
         lora_alpha=config.lora_alpha,
         lora_dropout=config.lora_dropout,
         lora_target_modules=config.lora_target_modules,
+        reward_head_init_std=config.reward_head_init_std,
     )
 
     # Ensure reward head is on device and fp32
@@ -772,8 +805,9 @@ def train_single_run(config: SweepConfig, output_dir: str, device: torch.device)
 
     # Baseline evaluation
     print("\nBaseline evaluation...")
-    baseline_out = evaluate_model(model, out_dist_val_dataset, device)
-    baseline_in = evaluate_model(model, in_dist_val_dataset, device)
+    eval_bs = config.eval_batch_size
+    baseline_out = evaluate_model(model, out_dist_val_dataset, device, batch_size=eval_bs)
+    baseline_in = evaluate_model(model, in_dist_val_dataset, device, batch_size=eval_bs)
     print(f"  Baseline out-dist accuracy: {baseline_out['accuracy']:.4f}")
     print(f"  Baseline in-dist accuracy: {baseline_in['accuracy']:.4f}")
 
@@ -793,6 +827,7 @@ def train_single_run(config: SweepConfig, output_dir: str, device: torch.device)
     }
 
     best_val_accuracy = 0.0
+    best_epoch = 0
 
     # Training loop
     for epoch in range(config.num_epochs):
@@ -809,7 +844,7 @@ def train_single_run(config: SweepConfig, output_dir: str, device: torch.device)
 
         train_dataloader = DataLoader(
             train_dataset, batch_size=config.batch_size, shuffle=True,
-            pin_memory=True if torch.cuda.is_available() else False
+            pin_memory=torch.cuda.is_available()
         )
 
         model.train()
@@ -821,23 +856,35 @@ def train_single_run(config: SweepConfig, output_dir: str, device: torch.device)
         epoch_ref_rej = []
         num_batches = len(train_dataloader)
 
+        optimizer.zero_grad()
         for step, batch in enumerate(train_dataloader):
-            if step % config.gradient_accumulation_steps == 0:
-                optimizer.zero_grad()
-
             preferred_input_ids = batch['preferred_input_ids'].to(device)
             preferred_attention_mask = batch['preferred_attention_mask'].to(device)
             rejected_input_ids = batch['rejected_input_ids'].to(device)
             rejected_attention_mask = batch['rejected_attention_mask'].to(device)
 
-            preferred_rewards = model(
-                input_ids=preferred_input_ids,
-                attention_mask=preferred_attention_mask
-            )
-            rejected_rewards = model(
-                input_ids=rejected_input_ids,
-                attention_mask=rejected_attention_mask
-            )
+            # Use return_hidden when we need reference rewards to avoid redundant backbone pass
+            need_hidden = reference_reward_head is not None and config.reference_kl_beta > 0
+            if need_hidden:
+                preferred_rewards, pref_hidden = model(
+                    input_ids=preferred_input_ids,
+                    attention_mask=preferred_attention_mask,
+                    return_hidden=True
+                )
+                rejected_rewards, rej_hidden = model(
+                    input_ids=rejected_input_ids,
+                    attention_mask=rejected_attention_mask,
+                    return_hidden=True
+                )
+            else:
+                preferred_rewards = model(
+                    input_ids=preferred_input_ids,
+                    attention_mask=preferred_attention_mask
+                )
+                rejected_rewards = model(
+                    input_ids=rejected_input_ids,
+                    attention_mask=rejected_attention_mask
+                )
 
             loss = bradley_terry_loss(preferred_rewards, rejected_rewards)
 
@@ -847,15 +894,9 @@ def train_single_run(config: SweepConfig, output_dir: str, device: torch.device)
 
             # Add KL regularization if reference model is enabled
             kl_loss = torch.tensor(0.0, device=device)
-            if reference_reward_head is not None and config.reference_kl_beta > 0:
-                ref_pref_rewards = compute_reference_rewards(
-                    model.backbone, reference_reward_head,
-                    preferred_input_ids, preferred_attention_mask
-                )
-                ref_rej_rewards = compute_reference_rewards(
-                    model.backbone, reference_reward_head,
-                    rejected_input_ids, rejected_attention_mask
-                )
+            if need_hidden:
+                ref_pref_rewards = compute_reference_rewards(reference_reward_head, pref_hidden)
+                ref_rej_rewards = compute_reference_rewards(reference_reward_head, rej_hidden)
                 # Track reference rewards for visualization
                 epoch_ref_pref.extend(ref_pref_rewards.detach().cpu().tolist())
                 epoch_ref_rej.extend(ref_rej_rewards.detach().cpu().tolist())
@@ -870,6 +911,8 @@ def train_single_run(config: SweepConfig, output_dir: str, device: torch.device)
             scaled_loss = loss / config.gradient_accumulation_steps
 
             if torch.isnan(loss):
+                print(f"  WARNING: NaN loss at epoch {epoch+1}, step {step+1}. Zeroing gradients and skipping.")
+                optimizer.zero_grad()
                 continue
 
             scaled_loss.backward()
@@ -882,6 +925,7 @@ def train_single_run(config: SweepConfig, output_dir: str, device: torch.device)
                 if config.use_gradient_clipping:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
                 optimizer.step()
+                optimizer.zero_grad()
                 if scheduler is not None:
                     scheduler.step()
 
@@ -889,8 +933,8 @@ def train_single_run(config: SweepConfig, output_dir: str, device: torch.device)
         avg_kl_loss = epoch_kl_loss / num_batches if epoch_kl_loss > 0 else 0.0
 
         # Validation
-        in_dist_eval = evaluate_model(model, in_dist_val_dataset, device)
-        out_dist_eval = evaluate_model(model, out_dist_val_dataset, device)
+        in_dist_eval = evaluate_model(model, in_dist_val_dataset, device, batch_size=eval_bs)
+        out_dist_eval = evaluate_model(model, out_dist_val_dataset, device, batch_size=eval_bs)
 
         print(f"  Loss: {avg_train_loss:.4f}")
         if config.use_reference_model and config.reference_kl_beta > 0:
@@ -926,13 +970,21 @@ def train_single_run(config: SweepConfig, output_dir: str, device: torch.device)
 
         if out_dist_eval['accuracy'] > best_val_accuracy:
             best_val_accuracy = out_dist_eval['accuracy']
-
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            best_epoch = epoch + 1
+            # Save best checkpoint
+            checkpoint_dir = os.path.join(output_dir, 'best_checkpoint')
+            os.makedirs(checkpoint_dir, exist_ok=True)
+            model.backbone.save_pretrained(checkpoint_dir)
+            torch.save({
+                'reward_head_state_dict': model.reward_head.state_dict(),
+                'epoch': best_epoch,
+                'out_dist_accuracy': best_val_accuracy,
+            }, os.path.join(checkpoint_dir, 'reward_head.pt'))
+            print(f"  New best! Saved checkpoint (epoch {best_epoch}, acc={best_val_accuracy:.4f})")
 
     # Final evaluation
-    final_out_eval = evaluate_model(model, out_dist_val_dataset, device)
-    final_in_eval = evaluate_model(model, in_dist_val_dataset, device)
+    final_out_eval = evaluate_model(model, out_dist_val_dataset, device, batch_size=eval_bs)
+    final_in_eval = evaluate_model(model, in_dist_val_dataset, device, batch_size=eval_bs)
 
     elapsed = time.time() - start_time
 
@@ -1010,9 +1062,22 @@ def run_sweep(configs: List[SweepConfig], output_base: str):
         print(f"{'='*60}")
 
         run_dir = os.path.join(sweep_dir, f"run_{i+1}_{config.name}")
-        result = train_single_run(config, run_dir, device)
-        result['run_index'] = i + 1
-        all_results.append(result)
+        try:
+            result = train_single_run(config, run_dir, device)
+            result['run_index'] = i + 1
+            all_results.append(result)
+        except Exception as e:
+            print(f"ERROR: Run {config.name} failed: {e}")
+            all_results.append({
+                'config': asdict(config),
+                'error': str(e),
+                'run_index': i + 1,
+                'trained': {'out_dist_accuracy': 0.0, 'in_dist_accuracy': 0.0, 'best_out_dist_accuracy': 0.0, 'error_type_breakdown': {}},
+                'baseline': {'out_dist_accuracy': 0.0, 'in_dist_accuracy': 0.0},
+                'improvement': {'out_dist_accuracy_gain': 0.0, 'in_dist_accuracy_gain': 0.0},
+                'training_time_minutes': 0.0,
+                'data': {'train_samples': 0, 'in_dist_val_samples': 0, 'out_dist_val_samples': 0},
+            })
 
     sweep_elapsed = time.time() - sweep_start
 
@@ -1029,6 +1094,10 @@ def run_sweep(configs: List[SweepConfig], output_base: str):
 
 def generate_sweep_summary(results: List[dict], sweep_dir: str, total_time: float):
     """Generate sweep summary JSON."""
+    if not results:
+        print("No results to summarize.")
+        return
+
     # Sort by out-dist accuracy
     sorted_results = sorted(
         results,
@@ -1120,7 +1189,7 @@ def generate_comparison_plot(results: List[dict], sweep_dir: str):
 # ============================================================
 def main():
     parser = argparse.ArgumentParser(description='Hyperparameter Sweep for Reward Model Training')
-    parser.add_argument('--output-dir', default='outputs/sweeps',
+    parser.add_argument('--output-dir', default=DEFAULT_OUTPUT_DIR,
                         help='Base output directory for sweep results')
     parser.add_argument('--configs', type=str, default=None,
                         help='Comma-separated run indices (1-indexed), e.g., "1,3,5"')
@@ -1137,6 +1206,10 @@ def main():
     configs = SWEEP_CONFIGS
     if args.configs:
         indices = [int(x.strip()) - 1 for x in args.configs.split(",")]
+        for i in indices:
+            if i < 0 or i >= len(SWEEP_CONFIGS):
+                print(f"Error: Config index {i+1} out of range (1-{len(SWEEP_CONFIGS)})")
+                sys.exit(1)
         configs = [SWEEP_CONFIGS[i] for i in indices]
         print(f"Running subset of configs: {[c.name for c in configs]}")
 
