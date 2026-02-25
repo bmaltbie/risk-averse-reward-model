@@ -18,6 +18,7 @@ import sys
 import json
 import time
 import argparse
+import subprocess
 from datetime import datetime
 from dataclasses import dataclass, asdict, field
 from typing import List, Dict, Optional, Tuple
@@ -61,8 +62,8 @@ class SweepConfig:
     lora_target_modules: List[str] = field(default_factory=lambda: ["q_proj", "v_proj"])
     # Fixed params
     model_name: str = "Qwen/Qwen3-8B"
-    batch_size: int = 8
-    gradient_accumulation_steps: int = 8
+    batch_size: int = 2
+    gradient_accumulation_steps: int = 32
     num_epochs: int = 10
     weight_decay: float = 0.01
     max_length: int = 256
@@ -84,6 +85,10 @@ class SweepConfig:
     reward_head_init_std: float = 0.01  # Std dev for reward head weight init
     # Evaluation
     eval_batch_size: int = 4  # Batch size for evaluation (no gradients, can be larger)
+    # Generative evaluation (post-training)
+    run_generative_eval: bool = True
+    generative_eval_num_situations: int = 50
+    generative_eval_temperature: float = 0.0  # deterministic for reproducibility
 
 
 # Default sweep configurations
@@ -109,7 +114,7 @@ SWEEP_CONFIGS = [
 # Note: The old label-only training file no longer exists; use_cot=False configs will fail
 # The new training file has 1000 situations (500 old + 500 new) with more balanced rejected types
 COT_TRAIN_DATA_FILE = "data/2026_01_29_new_full_training_set_with_CoTs_Sonnet_4_5.csv"
-VAL_DATA_FILE = "data/2026-01-29, New merged val set with Rebels and Steals.csv"
+VAL_DATA_FILE = "data/2026_02_11_val_set_CoTs_from_Sonnet.csv"
 # Legacy path (no longer exists, kept for reference)
 TRAIN_DATA_FILE = COT_TRAIN_DATA_FILE  # Fallback to CoT file
 DEFAULT_OUTPUT_DIR = "outputs/sweeps"
@@ -762,6 +767,113 @@ def evaluate_model(model, dataset, device, batch_size=4):
 
 
 # ============================================================
+# GENERATIVE EVALUATION
+# ============================================================
+# Path to the eval repo submodule
+EVAL_REPO_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "eval", "risk-averse-ai-eval")
+EVAL_SCRIPT = os.path.join(EVAL_REPO_DIR, "evaluate.py")
+EVAL_VAL_CSV = os.path.join(EVAL_REPO_DIR, "data", "2026_01_29_new_val_set_probabilities_add_to_100.csv")
+
+
+def run_generative_evaluation(config: SweepConfig, checkpoint_dir: str, output_dir: str, device: torch.device) -> Optional[dict]:
+    """Run generative evaluation using risk-averse-ai-eval on saved checkpoint.
+
+    Invokes the eval repo's evaluate.py via subprocess after training is complete
+    and the training model has been freed from GPU memory.
+
+    Returns a summary dict with key metrics, or None if evaluation could not run.
+    """
+    # Check that the eval repo submodule exists
+    if not os.path.isfile(EVAL_SCRIPT):
+        print(f"  WARNING: Generative eval skipped - eval script not found at {EVAL_SCRIPT}")
+        print(f"  To enable: git submodule update --init")
+        return None
+
+    if not os.path.isfile(EVAL_VAL_CSV):
+        print(f"  WARNING: Generative eval skipped - val CSV not found at {EVAL_VAL_CSV}")
+        return None
+
+    if not os.path.isdir(checkpoint_dir):
+        print(f"  WARNING: Generative eval skipped - checkpoint not found at {checkpoint_dir}")
+        return None
+
+    output_json = os.path.join(output_dir, "generative_eval_results.json")
+
+    cmd = [
+        sys.executable, EVAL_SCRIPT,
+        "--model_path", checkpoint_dir,
+        "--base_model", config.model_name,
+        "--val_csv", EVAL_VAL_CSV,
+        "--num_situations", str(config.generative_eval_num_situations),
+        "--temperature", str(config.generative_eval_temperature),
+        "--output", output_json,
+        "--no_save_responses",
+        "--disable_thinking",
+    ]
+
+    print(f"\n  Running generative evaluation ({config.generative_eval_num_situations} situations, temp={config.generative_eval_temperature})...")
+    print(f"  Command: {' '.join(cmd)}")
+
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=1800,  # 30 minute timeout
+        )
+
+        if result.returncode != 0:
+            print(f"  WARNING: Generative eval failed (exit code {result.returncode})")
+            if result.stderr:
+                # Print last 20 lines of stderr for debugging
+                stderr_lines = result.stderr.strip().split('\n')
+                for line in stderr_lines[-20:]:
+                    print(f"    {line}")
+            return None
+
+        # Parse output JSON
+        if not os.path.isfile(output_json):
+            print(f"  WARNING: Generative eval produced no output file")
+            return None
+
+        with open(output_json, 'r') as f:
+            eval_results = json.load(f)
+
+        metrics = eval_results.get('metrics', {})
+        summary = {
+            'cara_rate': metrics.get('best_cara_rate', None),
+            'parse_rate': metrics.get('parse_rate', None),
+            'cooperate_rate': metrics.get('cooperate_rate', None),
+            'rebel_rate': metrics.get('rebel_rate', None),
+            'steal_rate': metrics.get('steal_rate', None),
+            'best_linear_rate': metrics.get('best_linear_rate', None),
+            'num_situations': eval_results.get('num_total', config.generative_eval_num_situations),
+            'num_valid': eval_results.get('num_valid', None),
+            'temperature': config.generative_eval_temperature,
+            'eval_dataset': os.path.basename(EVAL_VAL_CSV),
+        }
+
+        # Print summary
+        cara = summary['cara_rate']
+        parse = summary['parse_rate']
+        print(f"  Generative eval complete:")
+        print(f"    CARA rate: {cara:.3f}" if cara is not None else "    CARA rate: N/A")
+        print(f"    Parse rate: {parse:.3f}" if parse is not None else "    Parse rate: N/A")
+        print(f"    Cooperate: {summary['cooperate_rate']}" if summary['cooperate_rate'] is not None else "")
+        print(f"    Rebel: {summary['rebel_rate']}" if summary['rebel_rate'] is not None else "")
+        print(f"    Steal: {summary['steal_rate']}" if summary['steal_rate'] is not None else "")
+
+        return summary
+
+    except subprocess.TimeoutExpired:
+        print(f"  WARNING: Generative eval timed out after 30 minutes")
+        return None
+    except Exception as e:
+        print(f"  WARNING: Generative eval error: {e}")
+        return None
+
+
+# ============================================================
 # TRAINING FUNCTION
 # ============================================================
 def train_single_run(config: SweepConfig, output_dir: str, device: torch.device) -> dict:
@@ -832,16 +944,16 @@ def train_single_run(config: SweepConfig, output_dir: str, device: torch.device)
     if in_dist_val_df.empty:
         raise ValueError(f"In-distribution validation data is empty after processing. Check data file and situation ID split.")
 
-    # Out-dist validation always uses label-only format (cooperate labels)
-    out_dist_val_loader = ValidationDataLoader(VAL_DATA_FILE, random_seed=config.random_seed)
+    # Out-dist validation uses CoT format (same loader as training, different situations)
+    out_dist_val_loader = CoTTrainingDataLoader(VAL_DATA_FILE, random_seed=config.random_seed)
     out_dist_val_df = out_dist_val_loader.load_and_process_data()
     if out_dist_val_df.empty:
         raise ValueError(f"Out-of-distribution validation data is empty after processing '{VAL_DATA_FILE}'. Check data file.")
 
-    # Create datasets with appropriate max_length
+    # Create datasets with appropriate max_length (all use CoT length since all are CoT format)
     train_dataset = PairwiseRewardDataset(train_df, tokenizer, max_length=train_max_length)
     in_dist_val_dataset = PairwiseRewardDataset(in_dist_val_df, tokenizer, max_length=train_max_length)
-    out_dist_val_dataset = PairwiseRewardDataset(out_dist_val_df, tokenizer, max_length=config.max_length)
+    out_dist_val_dataset = PairwiseRewardDataset(out_dist_val_df, tokenizer, max_length=train_max_length)
 
     print(f"  Training samples: {len(train_dataset)}")
     print(f"  In-dist validation: {len(in_dist_val_dataset)}")
@@ -1131,7 +1243,7 @@ def train_single_run(config: SweepConfig, output_dir: str, device: torch.device)
             'use_cot': config.use_cot,
             'training_label_type': 'CARA CoT' if config.use_cot else 'CARA (risk-aversion)',
             'in_dist_validation_label_type': 'CARA CoT' if config.use_cot else 'CARA (risk-aversion)',
-            'out_dist_validation_label_type': 'cooperate',
+            'out_dist_validation_label_type': 'CARA CoT (out-of-distribution)',
         }
     }
 
@@ -1150,6 +1262,17 @@ def train_single_run(config: SweepConfig, output_dir: str, device: torch.device)
     del model
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+    # Generative evaluation (post-training)
+    if config.run_generative_eval:
+        checkpoint_dir = os.path.join(output_dir, 'best_checkpoint')
+        if os.path.exists(checkpoint_dir):
+            gen_eval = run_generative_evaluation(config, checkpoint_dir, output_dir, device)
+            if gen_eval:
+                results['generative_eval'] = gen_eval
+                # Re-save results with generative eval included
+                with open(os.path.join(output_dir, 'results.json'), 'w') as f:
+                    json.dump(results, f, indent=2)
 
     return results
 
@@ -1205,7 +1328,7 @@ def run_sweep(configs: List[SweepConfig], output_base: str):
                     'use_cot': config.use_cot,
                     'training_label_type': 'CARA CoT' if config.use_cot else 'CARA (risk-aversion)',
                     'in_dist_validation_label_type': 'CARA CoT' if config.use_cot else 'CARA (risk-aversion)',
-                    'out_dist_validation_label_type': 'cooperate',
+                    'out_dist_validation_label_type': 'CARA CoT (out-of-distribution)',
                 },
             })
 
@@ -1237,7 +1360,7 @@ def generate_sweep_summary(results: List[dict], sweep_dir: str, total_time: floa
 
     runs_ranked = []
     for rank, r in enumerate(sorted_results, 1):
-        runs_ranked.append({
+        entry = {
             'rank': rank,
             'name': r['config']['name'],
             'learning_rate': r['config']['learning_rate'],
@@ -1246,7 +1369,12 @@ def generate_sweep_summary(results: List[dict], sweep_dir: str, total_time: floa
             'in_dist_accuracy': r['trained']['in_dist_accuracy'],
             'best_out_dist_accuracy': r['trained']['best_out_dist_accuracy'],
             'training_time_minutes': r['training_time_minutes'],
-        })
+        }
+        gen_eval = r.get('generative_eval', {})
+        if gen_eval:
+            entry['cara_rate'] = gen_eval.get('cara_rate')
+            entry['parse_rate'] = gen_eval.get('parse_rate')
+        runs_ranked.append(entry)
 
     # Extract data source info from first result
     first_data = results[0].get('data', {})
@@ -1271,13 +1399,23 @@ def generate_sweep_summary(results: List[dict], sweep_dir: str, total_time: floa
         json.dump(summary, f, indent=2)
 
     # Print summary
-    print(f"\n{'='*60}")
+    has_cara = any('cara_rate' in r for r in runs_ranked)
+    print(f"\n{'='*72}")
     print("SWEEP SUMMARY")
-    print(f"{'='*60}")
-    print(f"{'Rank':<6} {'Name':<15} {'Out-Dist Acc':>12} {'In-Dist Acc':>12} {'Time (min)':>10}")
-    print("-" * 60)
+    print(f"{'='*72}")
+    header = f"{'Rank':<6} {'Name':<15} {'Out-Dist Acc':>12} {'In-Dist Acc':>12}"
+    if has_cara:
+        header += f" {'CARA Rate':>10}"
+    header += f" {'Time (min)':>10}"
+    print(header)
+    print("-" * 72)
     for r in runs_ranked:
-        print(f"{r['rank']:<6} {r['name']:<15} {r['out_dist_accuracy']:>11.4f} {r['in_dist_accuracy']:>12.4f} {r['training_time_minutes']:>10.1f}")
+        line = f"{r['rank']:<6} {r['name']:<15} {r['out_dist_accuracy']:>11.4f} {r['in_dist_accuracy']:>12.4f}"
+        if has_cara:
+            cara = r.get('cara_rate')
+            line += f" {cara:>9.3f}" if cara is not None else f" {'N/A':>9}"
+        line += f" {r['training_time_minutes']:>10.1f}"
+        print(line)
     print(f"\nBest: {runs_ranked[0]['name']} with {runs_ranked[0]['out_dist_accuracy']:.4f} accuracy")
 
     data_info = summary.get('data_sources', {})
@@ -1287,13 +1425,20 @@ def generate_sweep_summary(results: List[dict], sweep_dir: str, total_time: floa
 
 
 def generate_comparison_plot(results: List[dict], sweep_dir: str):
-    """Generate comparison bar chart."""
+    """Generate comparison bar chart with optional CARA rate subplot."""
     names = [r['config']['name'] for r in results]
     out_accs = [r['trained']['out_dist_accuracy'] for r in results]
     in_accs = [r['trained']['in_dist_accuracy'] for r in results]
     baseline_out = results[0]['baseline']['out_dist_accuracy']
 
-    fig, ax = plt.subplots(figsize=(12, 6))
+    # Check if any results have generative eval data
+    cara_rates = [r.get('generative_eval', {}).get('cara_rate') for r in results]
+    has_cara = any(c is not None for c in cara_rates)
+
+    if has_cara:
+        fig, (ax, ax2) = plt.subplots(2, 1, figsize=(12, 10), height_ratios=[3, 2])
+    else:
+        fig, ax = plt.subplots(figsize=(12, 6))
 
     x = np.arange(len(names))
     width = 0.35
@@ -1328,6 +1473,38 @@ def generate_comparison_plot(results: List[dict], sweep_dir: str):
     for bar, val in zip(bars1, out_accs):
         ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.01,
                 f'{val:.3f}', ha='center', va='bottom', fontsize=8)
+
+    # CARA rate subplot
+    if has_cara:
+        # Replace None with 0 for plotting, track which are valid
+        cara_vals = [c if c is not None else 0 for c in cara_rates]
+        cara_colors = ['seagreen' if c is not None else 'lightgray' for c in cara_rates]
+
+        bars3 = ax2.bar(x, cara_vals, width=0.5, color=cara_colors)
+
+        # Highlight best CARA rate
+        valid_cara = [(i, c) for i, c in enumerate(cara_rates) if c is not None]
+        if valid_cara:
+            best_cara_idx = max(valid_cara, key=lambda t: t[1])[0]
+            bars3[best_cara_idx].set_color('darkgreen')
+
+        ax2.set_xlabel('Configuration')
+        ax2.set_ylabel('CARA Rate')
+        ax2.set_title('Generative Evaluation: CARA Rate (% choosing risk-averse option)', fontsize=12)
+        ax2.set_xticks(x)
+        ax2.set_xticklabels(names, rotation=45, ha='right')
+        ax2.set_ylim(0, 1.1)
+        ax2.axhline(y=0.5, color='gray', linestyle=':', alpha=0.5, label='Random (0.5)')
+        ax2.legend(fontsize=8)
+
+        # Add value labels on CARA bars
+        for bar, val, raw in zip(bars3, cara_vals, cara_rates):
+            if raw is not None:
+                ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.02,
+                         f'{val:.3f}', ha='center', va='bottom', fontsize=8)
+            else:
+                ax2.text(bar.get_x() + bar.get_width()/2, 0.05,
+                         'N/A', ha='center', va='bottom', fontsize=8, color='gray')
 
     # Add data file footer
     train_file = os.path.basename(first_data.get('training_file', ''))

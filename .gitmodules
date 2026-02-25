@@ -1,0 +1,3 @@
+[submodule "eval/risk-averse-ai-eval"]
+	path = eval/risk-averse-ai-eval
+	url = https://github.com/elliottthornley/risk-averse-ai-eval
