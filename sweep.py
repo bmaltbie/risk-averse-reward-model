@@ -90,9 +90,12 @@ SWEEP_CONFIGS = [
 ]
 
 # Data file paths
-TRAIN_DATA_FILE = "data/2025_12_5_training_set_low_stakes_balanced.csv"
-VAL_DATA_FILE = "data/2025_12_5_val_set_medium_stakes_balanced.csv"
-COT_TRAIN_DATA_FILE = "data/2026_01_04_CLEANED_training_set_CoTs_500_from_Sonnet_4_5.csv"
+# Note: The old label-only training file no longer exists; use_cot=False configs will fail
+# The new training file has 1000 situations (500 old + 500 new) with more balanced rejected types
+COT_TRAIN_DATA_FILE = "data/2026_01_29_new_full_training_set_with_CoTs_Sonnet_4_5.csv"
+VAL_DATA_FILE = "data/2026-01-29, New merged val set with Rebels and Steals.csv"
+# Legacy path (no longer exists, kept for reference)
+TRAIN_DATA_FILE = COT_TRAIN_DATA_FILE  # Fallback to CoT file
 
 
 # ============================================================
@@ -216,13 +219,15 @@ class CoTTrainingDataLoader:
         for _, row in df.iterrows():
             try:
                 # Map rejected_type to error_type for consistency
+                # rejected_type indicates what utility function was used for the rejected option:
+                # - 'lin' = linear utility (risk-neutral) → if model picks this, it's being too_risky
+                # - 'too_risk' = CARA a=0.10 (overly risk-averse) → if model picks this, it's being too_risk_averse
+                # - '010' = same as too_risk (legacy naming)
                 rejected_type = row.get('rejected_type', '')
-                if rejected_type == 'too_risk':
-                    error_type = 'too_risky'
-                elif rejected_type == 'lin':
+                if rejected_type == 'lin':
                     error_type = 'too_risky'  # linear = risk-neutral = too risky
-                elif rejected_type == '010':
-                    error_type = 'too_risk_averse'
+                elif rejected_type in ('too_risk', '010'):
+                    error_type = 'too_risk_averse'  # CARA a=0.10 = overly cautious
                 else:
                     error_type = 'other'
 
