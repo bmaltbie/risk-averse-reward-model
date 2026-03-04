@@ -1,0 +1,5 @@
+{
+  "status": "skipped",
+  "timestamp": "20260304_035050",
+  "error": "Reward eval skipped - eval script not found at eval/risk-averse-ai-eval/evaluate_reward_model.py"
+}

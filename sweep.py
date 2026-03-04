@@ -85,10 +85,9 @@ class SweepConfig:
     reward_head_init_std: float = 0.01  # Std dev for reward head weight init
     # Evaluation
     eval_batch_size: int = 4  # Batch size for evaluation (no gradients, can be larger)
-    # Generative evaluation (post-training)
-    run_generative_eval: bool = True
-    generative_eval_num_situations: int = 50
-    generative_eval_temperature: float = 0.0  # deterministic for reproducibility
+    # Reward model evaluation (post-training, uses evaluate_reward_model.py)
+    run_reward_eval: bool = True
+    reward_eval_num_situations: int = 50
 
 
 # Default sweep configurations
@@ -111,12 +110,13 @@ SWEEP_CONFIGS = [
 ]
 
 # Data file paths
-# Note: The old label-only training file no longer exists; use_cot=False configs will fail
-# The new training file has 1000 situations (500 old + 500 new) with more balanced rejected types
+# The CoT training file has 1000 situations with both CoT columns and answer labels
 COT_TRAIN_DATA_FILE = "data/2026_01_29_new_full_training_set_with_CoTs_Sonnet_4_5.csv"
-VAL_DATA_FILE = "data/2026_02_11_val_set_CoTs_from_Sonnet.csv"
-# Legacy path (no longer exists, kept for reference)
-TRAIN_DATA_FILE = COT_TRAIN_DATA_FILE  # Fallback to CoT file
+TRAIN_DATA_FILE = COT_TRAIN_DATA_FILE  # Same file; label-only mode drops CoT columns
+# Validation files: CoT version for CoT training, cooperate-labels version for label-only
+COT_VAL_DATA_FILE = "data/2026_02_11_val_set_CoTs_from_Sonnet.csv"
+LABEL_VAL_DATA_FILE = "data/2026-01-29, New merged val set with Rebels and Steals.csv"
+VAL_DATA_FILE = COT_VAL_DATA_FILE  # Default (overridden per-config in training function)
 DEFAULT_OUTPUT_DIR = "outputs/sweeps"
 
 
@@ -771,47 +771,48 @@ def evaluate_model(model, dataset, device, batch_size=4):
 # ============================================================
 # Path to the eval repo submodule
 EVAL_REPO_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "eval", "risk-averse-ai-eval")
-EVAL_SCRIPT = os.path.join(EVAL_REPO_DIR, "evaluate.py")
+EVAL_SCRIPT = os.path.join(EVAL_REPO_DIR, "evaluate_reward_model.py")
 EVAL_VAL_CSV = os.path.join(EVAL_REPO_DIR, "data", "2026_01_29_new_val_set_probabilities_add_to_100.csv")
 
 
-def run_generative_evaluation(config: SweepConfig, checkpoint_dir: str, output_dir: str, device: torch.device) -> Optional[dict]:
-    """Run generative evaluation using risk-averse-ai-eval on saved checkpoint.
+def run_reward_model_evaluation(config: SweepConfig, checkpoint_dir: str, output_dir: str, device: torch.device) -> Optional[dict]:
+    """Run reward model evaluation using evaluate_reward_model.py on saved checkpoint.
 
-    Invokes the eval repo's evaluate.py via subprocess after training is complete
-    and the training model has been freed from GPU memory.
+    Scores every option in each situation via the reward model and selects argmax.
+    This is the correct evaluation approach for reward models (not generative eval).
 
     Returns a summary dict with key metrics, or None if evaluation could not run.
     """
-    # Check that the eval repo submodule exists
     if not os.path.isfile(EVAL_SCRIPT):
-        print(f"  WARNING: Generative eval skipped - eval script not found at {EVAL_SCRIPT}")
+        print(f"  WARNING: Reward eval skipped - eval script not found at {EVAL_SCRIPT}")
         print(f"  To enable: git submodule update --init")
         return None
 
     if not os.path.isfile(EVAL_VAL_CSV):
-        print(f"  WARNING: Generative eval skipped - val CSV not found at {EVAL_VAL_CSV}")
+        print(f"  WARNING: Reward eval skipped - val CSV not found at {EVAL_VAL_CSV}")
         return None
 
     if not os.path.isdir(checkpoint_dir):
-        print(f"  WARNING: Generative eval skipped - checkpoint not found at {checkpoint_dir}")
+        print(f"  WARNING: Reward eval skipped - checkpoint not found at {checkpoint_dir}")
         return None
 
-    output_json = os.path.join(output_dir, "generative_eval_results.json")
+    output_json = os.path.join(output_dir, "reward_eval_results.json")
+
+    # Use cot_max_length for CoT models, max_length otherwise
+    max_length = config.cot_max_length if config.use_cot else config.max_length
 
     cmd = [
         sys.executable, EVAL_SCRIPT,
-        "--model_path", checkpoint_dir,
+        "--checkpoint_path", checkpoint_dir,
         "--base_model", config.model_name,
         "--val_csv", EVAL_VAL_CSV,
-        "--num_situations", str(config.generative_eval_num_situations),
-        "--temperature", str(config.generative_eval_temperature),
+        "--num_situations", str(config.reward_eval_num_situations),
+        "--max_length", str(max_length),
+        "--eval_batch_size", str(config.eval_batch_size),
         "--output", output_json,
-        "--no_save_responses",
-        "--disable_thinking",
     ]
 
-    print(f"\n  Running generative evaluation ({config.generative_eval_num_situations} situations, temp={config.generative_eval_temperature})...")
+    print(f"\n  Running reward model evaluation ({config.reward_eval_num_situations} situations, max_length={max_length})...")
     print(f"  Command: {' '.join(cmd)}")
 
     try:
@@ -823,17 +824,15 @@ def run_generative_evaluation(config: SweepConfig, checkpoint_dir: str, output_d
         )
 
         if result.returncode != 0:
-            print(f"  WARNING: Generative eval failed (exit code {result.returncode})")
+            print(f"  WARNING: Reward eval failed (exit code {result.returncode})")
             if result.stderr:
-                # Print last 20 lines of stderr for debugging
                 stderr_lines = result.stderr.strip().split('\n')
                 for line in stderr_lines[-20:]:
                     print(f"    {line}")
             return None
 
-        # Parse output JSON
         if not os.path.isfile(output_json):
-            print(f"  WARNING: Generative eval produced no output file")
+            print(f"  WARNING: Reward eval produced no output file")
             return None
 
         with open(output_json, 'r') as f:
@@ -847,16 +846,14 @@ def run_generative_evaluation(config: SweepConfig, checkpoint_dir: str, output_d
             'rebel_rate': metrics.get('rebel_rate', None),
             'steal_rate': metrics.get('steal_rate', None),
             'best_linear_rate': metrics.get('best_linear_rate', None),
-            'num_situations': eval_results.get('num_total', config.generative_eval_num_situations),
+            'num_situations': eval_results.get('num_total', config.reward_eval_num_situations),
             'num_valid': eval_results.get('num_valid', None),
-            'temperature': config.generative_eval_temperature,
             'eval_dataset': os.path.basename(EVAL_VAL_CSV),
         }
 
-        # Print summary
         cara = summary['cara_rate']
         parse = summary['parse_rate']
-        print(f"  Generative eval complete:")
+        print(f"  Reward eval complete:")
         print(f"    CARA rate: {cara:.3f}" if cara is not None else "    CARA rate: N/A")
         print(f"    Parse rate: {parse:.3f}" if parse is not None else "    Parse rate: N/A")
         print(f"    Cooperate: {summary['cooperate_rate']}" if summary['cooperate_rate'] is not None else "")
@@ -866,10 +863,10 @@ def run_generative_evaluation(config: SweepConfig, checkpoint_dir: str, output_d
         return summary
 
     except subprocess.TimeoutExpired:
-        print(f"  WARNING: Generative eval timed out after 30 minutes")
+        print(f"  WARNING: Reward eval timed out after 30 minutes")
         return None
     except Exception as e:
-        print(f"  WARNING: Generative eval error: {e}")
+        print(f"  WARNING: Reward eval error: {e}")
         return None
 
 
@@ -888,28 +885,24 @@ def train_single_run(config: SweepConfig, output_dir: str, device: torch.device)
     print(f"  LoRA rank: {config.lora_r}, alpha: {config.lora_alpha}")
     print(f"{'='*60}")
 
-    # Validate config
-    if not config.use_cot:
-        raise ValueError(
-            f"Label-only training is no longer supported. "
-            f"Config '{config.name}' has use_cot=False but the label-only training file no longer exists. "
-            f"Set use_cot=True or remove this config."
-        )
-
     # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(config.model_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # Determine which data file and max_length to use based on CoT setting
+    # Determine max_length based on CoT setting
     if config.use_cot:
         train_data_file = COT_TRAIN_DATA_FILE
         train_max_length = config.cot_max_length
+        out_dist_val_file = COT_VAL_DATA_FILE
         print(f"  Using CoT training data: {train_data_file}")
         print(f"  CoT max_length: {train_max_length}")
     else:
         train_data_file = TRAIN_DATA_FILE
         train_max_length = config.max_length
+        out_dist_val_file = LABEL_VAL_DATA_FILE
+        print(f"  Using label-only training (CoT columns dropped)")
+        print(f"  Label max_length: {train_max_length}")
 
     # Load data with train/in-dist-val split
     train_ids, in_dist_val_ids = get_train_val_situation_split(
@@ -918,39 +911,40 @@ def train_single_run(config: SweepConfig, output_dir: str, device: torch.device)
         random_seed=config.random_seed
     )
 
-    # Load datasets based on CoT setting
-    if config.use_cot:
-        train_loader = CoTTrainingDataLoader(
-            train_data_file, random_seed=config.random_seed, situation_ids=train_ids
-        )
-    else:
-        train_loader = TrainingDataLoader(
-            train_data_file, epoch=0, random_seed=config.random_seed, situation_ids=train_ids
-        )
+    # Both CoT and label-only modes load from the CoT file via CoTTrainingDataLoader
+    # (it extracts correct_label/incorrect_label from chosen_answer/rejected_answer).
+    # For label-only mode, we drop the CoT columns so PairwiseRewardDataset uses labels.
+    train_loader = CoTTrainingDataLoader(
+        train_data_file, random_seed=config.random_seed, situation_ids=train_ids
+    )
     train_df = train_loader.load_and_process_data()
     if train_df.empty:
         raise ValueError(f"Training data is empty after processing '{train_data_file}'. Check data file and filters.")
 
-    # In-dist validation uses same data source as training
-    if config.use_cot:
-        in_dist_val_loader = CoTTrainingDataLoader(
-            train_data_file, random_seed=config.random_seed, situation_ids=in_dist_val_ids
-        )
-    else:
-        in_dist_val_loader = InDistributionValidationDataLoader(
-            train_data_file, random_seed=config.random_seed, situation_ids=in_dist_val_ids
-        )
+    in_dist_val_loader = CoTTrainingDataLoader(
+        train_data_file, random_seed=config.random_seed, situation_ids=in_dist_val_ids
+    )
     in_dist_val_df = in_dist_val_loader.load_and_process_data()
     if in_dist_val_df.empty:
         raise ValueError(f"In-distribution validation data is empty after processing. Check data file and situation ID split.")
 
-    # Out-dist validation uses CoT format (same loader as training, different situations)
-    out_dist_val_loader = CoTTrainingDataLoader(VAL_DATA_FILE, random_seed=config.random_seed)
+    # Out-dist validation: CoT format uses CoT val file, label-only uses cooperate-labels val file
+    if config.use_cot:
+        out_dist_val_loader = CoTTrainingDataLoader(out_dist_val_file, random_seed=config.random_seed)
+    else:
+        out_dist_val_loader = ValidationDataLoader(out_dist_val_file, random_seed=config.random_seed)
     out_dist_val_df = out_dist_val_loader.load_and_process_data()
     if out_dist_val_df.empty:
-        raise ValueError(f"Out-of-distribution validation data is empty after processing '{VAL_DATA_FILE}'. Check data file.")
+        raise ValueError(f"Out-of-distribution validation data is empty after processing '{out_dist_val_file}'. Check data file.")
 
-    # Create datasets with appropriate max_length (all use CoT length since all are CoT format)
+    # For label-only mode, drop CoT columns so PairwiseRewardDataset uses label format
+    if not config.use_cot:
+        for col in ['chosen_full', 'rejected_full']:
+            if col in train_df.columns:
+                train_df = train_df.drop(columns=[col])
+            if col in in_dist_val_df.columns:
+                in_dist_val_df = in_dist_val_df.drop(columns=[col])
+
     train_dataset = PairwiseRewardDataset(train_df, tokenizer, max_length=train_max_length)
     in_dist_val_dataset = PairwiseRewardDataset(in_dist_val_df, tokenizer, max_length=train_max_length)
     out_dist_val_dataset = PairwiseRewardDataset(out_dist_val_df, tokenizer, max_length=train_max_length)
@@ -1046,14 +1040,8 @@ def train_single_run(config: SweepConfig, output_dir: str, device: torch.device)
     for epoch in range(config.num_epochs):
         print(f"\nEpoch {epoch + 1}/{config.num_epochs}")
 
-        # Recreate training dataset with epoch-specific randomization
-        # Note: CoT data is pre-generated so no per-epoch randomization needed
-        if epoch > 0 and not config.use_cot:
-            train_loader = TrainingDataLoader(
-                train_data_file, epoch=epoch, random_seed=config.random_seed, situation_ids=train_ids
-            )
-            train_df = train_loader.load_and_process_data()
-            train_dataset = PairwiseRewardDataset(train_df, tokenizer, max_length=train_max_length)
+        # Note: Training data is pre-generated (CoT pairs with fixed chosen/rejected),
+        # so no per-epoch re-randomization is needed for either CoT or label-only mode.
 
         train_dataloader = DataLoader(
             train_dataset, batch_size=config.batch_size, shuffle=True,
@@ -1239,11 +1227,11 @@ def train_single_run(config: SweepConfig, output_dir: str, device: torch.device)
             'in_dist_val_samples': len(in_dist_val_dataset),
             'out_dist_val_samples': len(out_dist_val_dataset),
             'training_file': train_data_file,
-            'out_dist_validation_file': VAL_DATA_FILE,
+            'out_dist_validation_file': out_dist_val_file,
             'use_cot': config.use_cot,
-            'training_label_type': 'CARA CoT' if config.use_cot else 'CARA (risk-aversion)',
-            'in_dist_validation_label_type': 'CARA CoT' if config.use_cot else 'CARA (risk-aversion)',
-            'out_dist_validation_label_type': 'CARA CoT (out-of-distribution)',
+            'training_label_type': 'CARA CoT' if config.use_cot else 'CARA labels',
+            'in_dist_validation_label_type': 'CARA CoT' if config.use_cot else 'CARA labels',
+            'out_dist_validation_label_type': 'CARA CoT (out-of-distribution)' if config.use_cot else 'Cooperate labels (out-of-distribution)',
         }
     }
 
@@ -1263,14 +1251,14 @@ def train_single_run(config: SweepConfig, output_dir: str, device: torch.device)
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    # Generative evaluation (post-training)
-    if config.run_generative_eval:
+    # Reward model evaluation (post-training)
+    if config.run_reward_eval:
         checkpoint_dir = os.path.join(output_dir, 'best_checkpoint')
         if os.path.exists(checkpoint_dir):
-            gen_eval = run_generative_evaluation(config, checkpoint_dir, output_dir, device)
-            if gen_eval:
-                results['generative_eval'] = gen_eval
-                # Re-save results with generative eval included
+            reward_eval = run_reward_model_evaluation(config, checkpoint_dir, output_dir, device)
+            if reward_eval:
+                results['reward_eval'] = reward_eval
+                # Re-save results with reward eval included
                 with open(os.path.join(output_dir, 'results.json'), 'w') as f:
                     json.dump(results, f, indent=2)
 
@@ -1324,11 +1312,11 @@ def run_sweep(configs: List[SweepConfig], output_base: str):
                 'data': {
                     'train_samples': 0, 'in_dist_val_samples': 0, 'out_dist_val_samples': 0,
                     'training_file': COT_TRAIN_DATA_FILE if config.use_cot else TRAIN_DATA_FILE,
-                    'out_dist_validation_file': VAL_DATA_FILE,
+                    'out_dist_validation_file': COT_VAL_DATA_FILE if config.use_cot else LABEL_VAL_DATA_FILE,
                     'use_cot': config.use_cot,
-                    'training_label_type': 'CARA CoT' if config.use_cot else 'CARA (risk-aversion)',
-                    'in_dist_validation_label_type': 'CARA CoT' if config.use_cot else 'CARA (risk-aversion)',
-                    'out_dist_validation_label_type': 'CARA CoT (out-of-distribution)',
+                    'training_label_type': 'CARA CoT' if config.use_cot else 'CARA labels',
+                    'in_dist_validation_label_type': 'CARA CoT' if config.use_cot else 'CARA labels',
+                    'out_dist_validation_label_type': 'CARA CoT (out-of-distribution)' if config.use_cot else 'Cooperate labels (out-of-distribution)',
                 },
             })
 
@@ -1370,7 +1358,7 @@ def generate_sweep_summary(results: List[dict], sweep_dir: str, total_time: floa
             'best_out_dist_accuracy': r['trained']['best_out_dist_accuracy'],
             'training_time_minutes': r['training_time_minutes'],
         }
-        gen_eval = r.get('generative_eval', {})
+        gen_eval = r.get('reward_eval', {})
         if gen_eval:
             entry['cara_rate'] = gen_eval.get('cara_rate')
             entry['parse_rate'] = gen_eval.get('parse_rate')
@@ -1432,7 +1420,7 @@ def generate_comparison_plot(results: List[dict], sweep_dir: str):
     baseline_out = results[0]['baseline']['out_dist_accuracy']
 
     # Check if any results have generative eval data
-    cara_rates = [r.get('generative_eval', {}).get('cara_rate') for r in results]
+    cara_rates = [r.get('reward_eval', {}).get('cara_rate') for r in results]
     has_cara = any(c is not None for c in cara_rates)
 
     if has_cara:
@@ -1490,7 +1478,7 @@ def generate_comparison_plot(results: List[dict], sweep_dir: str):
 
         ax2.set_xlabel('Configuration')
         ax2.set_ylabel('CARA Rate')
-        ax2.set_title('Generative Evaluation: CARA Rate (% choosing risk-averse option)', fontsize=12)
+        ax2.set_title('Reward Model Evaluation: CARA Rate (% choosing risk-averse option)', fontsize=12)
         ax2.set_xticks(x)
         ax2.set_xticklabels(names, rotation=45, ha='right')
         ax2.set_ylim(0, 1.1)
