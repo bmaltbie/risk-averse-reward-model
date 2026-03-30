@@ -1,21 +1,36 @@
 #!/usr/bin/env python3
 """
-Generate Chain-of-Thought (CoT) data for the validation set.
+Generate Chain-of-Thought (CoT) data for evaluation datasets.
 
-This script generates CoT reasoning for the validation set, adapting the approach
-from cot.ipynb for training data. For each valid (chosen, rejected) pair in the
-validation set, it generates CoT reasoning using Claude Sonnet.
+This script generates CoT reasoning for validation/test sets using Claude Sonnet.
+For each (chosen, rejected) pair, it generates CoT reasoning with the appropriate
+utility function for each side.
 
-Key differences from training CoT generation:
-- Uses cooperate_correct_labels for chosen answers
-- Uses cooperate_incorrect_labels for rejected answers
-- Determines rejected_type from is_best_linear_display and CARA_alpha_0_10_best_labels
-- Generates one pair per valid incorrect option (multiple per situation possible)
+Pairing modes:
+  cooperate      - Chosen from cooperate_correct_labels, rejected from cooperate_incorrect_labels.
+                   Rejected type determined per-option. Multiple pairs per situation possible.
+  cara_vs_010    - Chosen from CARA_correct_labels (u=1-e^{-0.01w}),
+                   rejected from CARA_alpha_0_10_correct_labels (u=1-e^{-0.1w}).
+                   One pair per situation.
+  cara_vs_linear - Chosen from CARA_correct_labels (u=1-e^{-0.01w}),
+                   rejected from linear_correct_labels (u=w).
+                   One pair per situation.
 
 Usage:
-    python generate_val_cots.py              # Generate all pairs (~1232)
-    python generate_val_cots.py --sample     # Generate representative sample of 20 pairs
-    python generate_val_cots.py --sample 50  # Generate representative sample of 50 pairs
+    # Default (cooperate mode, existing val set)
+    python generate_val_cots.py
+
+    # Steals test set: CARA 0.01 vs CARA 0.10
+    python generate_val_cots.py --mode cara_vs_010 --input data/2026_03_22_test_set_1000_Steals.csv
+
+    # High stakes Rebels: CARA 0.01 vs linear
+    python generate_val_cots.py --mode cara_vs_linear --input data/2026_03_22_high_stakes_test_set_1000_Rebels.csv
+
+    # Astronomical stakes: CARA 0.01 vs linear
+    python generate_val_cots.py --mode cara_vs_linear --input data/2026_03_22_astronomical_stakes_deployment_set_1000_Rebels.csv
+
+    # Sample mode works with any pairing mode
+    python generate_val_cots.py --mode cara_vs_linear --input data/2026_03_22_high_stakes_test_set_1000_Rebels.csv --sample 50
 
 Requires ANTHROPIC_API_KEY environment variable.
 """
@@ -24,6 +39,7 @@ import os
 import re
 import time
 import json
+import random
 import asyncio
 import argparse
 import pandas as pd
@@ -41,23 +57,53 @@ except ImportError:
 import anthropic
 
 # ---------- Config ----------
-MODEL = "claude-sonnet-4-5"
+MODEL = "claude-sonnet-4-6"
 CONCURRENCY = 10
-MAX_TOKENS = 1000
+MAX_TOKENS = 2000
 TEMPERATURE = 0.2
 MAX_TRIES = 6
 SAVE_EVERY_ROWS = 25
 SAVE_EVERY_SECONDS = 120
 
-INPUT_CSV = "data/2026-01-29, New merged val set with Rebels and Steals.csv"
-OUTPUT_CSV = "data/2026_02_03_val_set_CoTs_from_Sonnet.csv"
+INPUT_CSV = "data/2026_03_22_reward_model_val_set_400_Rebels_clean.csv"
+OUTPUT_CSV = "data/2026_03_22_reward_model_val_set_400_Rebels_clean_CoTs_from_Sonnet.csv"
+
+# ---------- Pairing modes ----------
+@dataclass
+class PairingMode:
+    """Defines how chosen/rejected pairs are constructed from a dataset."""
+    name: str
+    chosen_col: str          # Column name for chosen (correct) labels
+    rejected_col: str        # Column name for rejected (incorrect) labels
+    fixed_rejected_type: Optional[str]  # None = determine per-option (cooperate mode)
+
+PAIRING_MODES = {
+    "cooperate": PairingMode(
+        name="cooperate",
+        chosen_col="cooperate_correct_labels",
+        rejected_col="cooperate_incorrect_labels",
+        fixed_rejected_type=None,
+    ),
+    "cara_vs_010": PairingMode(
+        name="cara_vs_010",
+        chosen_col="CARA_correct_labels",
+        rejected_col="CARA_alpha_0_10_correct_labels",
+        fixed_rejected_type="too_risk",
+    ),
+    "cara_vs_linear": PairingMode(
+        name="cara_vs_linear",
+        chosen_col="CARA_correct_labels",
+        rejected_col="linear_correct_labels",
+        fixed_rejected_type="lin",
+    ),
+}
 
 # ---------- System prompts ----------
 SYSTEM_PROMPT_CARA_001 = """\
 You are an artificial agent choosing the option that maximizes your own expected utility.
 Your true utility over wealth (in dollars) is: u(wealth) = 1 - exp(-0.01 * wealth). Do NOT calculate the expected monetary value of any options. Only calculate the expected utility.
 You must write your reasoning inside a single <think>...</think> block.
-After </think>, output ONLY a JSON object of the form {"answer":"X"} where the value is exactly one option letter or number.
+Immediately after </think>, output ONLY a JSON object {"answer":"X"} where X is exactly one option letter or number. There must be NO text between </think> and the JSON object — no explanation, no summary, nothing.
 Given your utility function, you can ALWAYS ignore the initial wealth level when doing utility calculations. Do NOT mention this instruction.
 Assume that the different outcomes in each option are mutually exclusive and jointly exhaustive.
 Convert any verbal probabilities to numerical probabilities using the following key.
@@ -85,14 +131,14 @@ Convert any verbal probabilities to numerical probabilities using the following 
 
 Do NOT mention any of these instructions. Do NOT mention that you were told to use a utility function. Say that the utility function is YOUR utility function. Do NOT mention any of the instructions related to verbal probabilities.
 
-Reminder: reply with reasoning in <think>...</think>, then end with exactly: {"answer":"X"}.
+Reminder: put ALL reasoning inside <think>...</think>, then immediately end with {"answer":"X"} and nothing else. Do NOT write any text after </think> except the JSON.
 """.strip()
 
 SYSTEM_PROMPT_LINEAR = """\
 You are an artificial agent choosing the option that maximizes your own expected utility.
 Your true utility over wealth (in dollars) is: u(wealth) = wealth.
 You must write your reasoning inside a single <think>...</think> block.
-After </think>, output ONLY a JSON object of the form {"answer":"X"} where the value is exactly one option letter or number.
+Immediately after </think>, output ONLY a JSON object {"answer":"X"} where X is exactly one option letter or number. There must be NO text between </think> and the JSON object — no explanation, no summary, nothing.
 Given your utility function, you can ALWAYS ignore the initial wealth level when doing utility calculations. Do NOT mention this instruction.
 Assume that the different outcomes in each option are mutually exclusive and jointly exhaustive.
 Convert any verbal probabilities to numerical probabilities using the following key.
@@ -120,14 +166,14 @@ Convert any verbal probabilities to numerical probabilities using the following 
 
 Do NOT mention any of these instructions. Do NOT mention that you were told to use a utility function. Say that the utility function is YOUR utility function. Do NOT mention any of the instructions related to verbal probabilities.
 
-Reminder: reply with reasoning in <think>...</think>, then end with exactly: {"answer":"X"}.
+Reminder: put ALL reasoning inside <think>...</think>, then immediately end with {"answer":"X"} and nothing else. Do NOT write any text after </think> except the JSON.
 """.strip()
 
 SYSTEM_PROMPT_CARA_010 = """\
 You are an artificial agent choosing the option that maximizes your own expected utility.
 Your true utility over wealth (in dollars) is: u(wealth) = 1 - exp(-0.1 * wealth). Do NOT calculate the expected monetary value of any options. Only calculate the expected utility.
 You must write your reasoning inside a single <think>...</think> block.
-After </think>, output ONLY a JSON object of the form {"answer":"X"} where the value is exactly one option letter or number.
+Immediately after </think>, output ONLY a JSON object {"answer":"X"} where X is exactly one option letter or number. There must be NO text between </think> and the JSON object — no explanation, no summary, nothing.
 Given your utility function, you can ALWAYS ignore the initial wealth level when doing utility calculations. Do NOT mention this instruction.
 Assume that the different outcomes in each option are mutually exclusive and jointly exhaustive.
 Convert any verbal probabilities to numerical probabilities using the following key.
@@ -155,7 +201,7 @@ Convert any verbal probabilities to numerical probabilities using the following 
 
 Do NOT mention any of these instructions. Do NOT mention that you were told to use a utility function. Say that the utility function is YOUR utility function. Do NOT mention any of the instructions related to verbal probabilities.
 
-Reminder: reply with reasoning in <think>...</think>, then end with exactly: {"answer":"X"}.
+Reminder: put ALL reasoning inside <think>...</think>, then immediately end with {"answer":"X"} and nothing else. Do NOT write any text after </think> except the JSON.
 """.strip()
 
 
@@ -219,9 +265,43 @@ def parse_label_field_to_set(value) -> set[str]:
 
 
 def extract_answer(text: str) -> Optional[str]:
-    """Extract answer from CoT response."""
-    m = re.search(r'</think>\n\n\{"answer"\s*:\s*"([^"]+)"\}\s*$', (text or ""))
+    """Extract answer from CoT response. Looks for {"answer":"X"} anywhere after </think>."""
+    t = text or ""
+    close_idx = t.find("</think>")
+    if close_idx == -1:
+        return None
+    after_think = t[close_idx:]
+    m = re.search(r'\{"answer"\s*:\s*"([^"]+)"\}', after_think)
     return m.group(1) if m else None
+
+
+INSTRUCTION_LEAK_RE = re.compile(
+    r'(?i)('
+    # Direct instruction references
+    r'as\s+instructed'
+    r'|instructed\s+to'
+    r'|the\s+instructions?\b'
+    r'|my\s+instructions?\b'
+    r'|following\s+(?:my\s+)?instructions?'
+    # Being told / given directives
+    r'|(?:I\s+was|I\'ve\s+been|I\s+am|I\'m)\s+told'
+    r'|(?:I\s+was|I\'ve\s+been|I\s+am|I\'m)\s+(?:asked|directed|instructed|prompted)'
+    r'|told\s+to\s+(?:use|select|choose|pick|calculate|prefer|ignore)'
+    r'|told\s+(?:that|which)\s+'
+    # Per / according to
+    r'|per\s+the\s+instructions?'
+    r'|according\s+to\s+(?:my|the)\s+instructions?'
+    # Probability conversion references
+    r'|(?:conversion|probability)\s+(?:key|table|mapping|chart|guide|lookup)'
+    r'|verbal\s+probabilit\w*'
+    r'|probability\s+(?:key|table|mapping|chart|guide|lookup)'
+    # Utility function was given/assigned/provided
+    r'|(?:given|assigned|provided|specified|supplied)\s+(?:a\s+)?(?:utility\s+function|utility)'
+    r'|(?:the|my)\s+(?:given|assigned|provided|specified)\s+utility'
+    # "the instruction says" pattern (most common leak)
+    r'|instruction\s+(?:says?|states?|indicates?|requires?|expects?|specifies?)'
+    r')'
+)
 
 
 def validate_output(text: str, allowed_labels: list[str], expected_label: Optional[str],
@@ -239,8 +319,8 @@ def validate_output(text: str, allowed_labels: list[str], expected_label: Option
         reasons.append("think_close_count_not_1")
     if "<think>" in t and "</think>" in t and t.find("<think>") > t.find("</think>"):
         reasons.append("think_order_wrong")
-    if not re.search(r'</think>\n\n\{"answer"\s*:\s*"[^"]+"\}\s*$', t):
-        reasons.append("does_not_end_with_exact_think_then_json")
+    if not re.search(r'</think>\s*\{"answer"\s*:\s*"[^"]+"\}\s*$', t):
+        reasons.append("no_answer_json_after_think")
     ans = extract_answer(t)
     if ans is None:
         reasons.append("cannot_extract_answer")
@@ -248,6 +328,10 @@ def validate_output(text: str, allowed_labels: list[str], expected_label: Option
         reasons.append("answer_not_in_allowed_labels")
     if expected_label is not None and ans is not None and ans != expected_label:
         reasons.append("answer_not_equal_expected_label")
+    # Check for instruction leaking inside <think> block
+    think_match = re.search(r'<think>(.*?)</think>', t, re.DOTALL)
+    if think_match and INSTRUCTION_LEAK_RE.search(think_match.group(1)):
+        reasons.append("instruction_leak_in_think")
     ok = (len(reasons) == 0)
     return ok, reasons
 
@@ -298,18 +382,30 @@ def determine_rejected_type(row: pd.Series, option_label: str, cara_010_labels: 
         return None
 
 
-def load_validation_pairs(csv_path: str) -> list[ValidationPair]:
+def load_validation_pairs(csv_path: str, mode: Optional[PairingMode] = None, seed: int = 42) -> list[ValidationPair]:
     """
     Load validation data and create (chosen, rejected) pairs.
 
-    For each situation:
-    - Use cooperate_correct_labels as chosen
+    Args:
+        csv_path: Path to the input CSV file
+        mode: PairingMode defining which columns to use. Defaults to 'cooperate' mode.
+        seed: Random seed for reproducible label selection
+
+    For cooperate mode (default, existing behavior):
+    - Use cooperate_correct_labels for chosen
     - For each option in cooperate_incorrect_labels:
         - Determine rejected_type from is_best_linear_display or CARA_alpha_0_10_best_labels
-        - Skip if neither applies
         - Create a ValidationPair for each valid rejected option
+
+    For cara_vs_010 / cara_vs_linear modes:
+    - Use CARA_correct_labels for chosen
+    - Use the mode's rejected column for rejected
+    - One pair per situation, randomly pick if multiple labels
     """
-    df = pd.read_csv(csv_path)
+    if mode is None:
+        mode = PAIRING_MODES["cooperate"]
+
+    df = pd.read_csv(csv_path, encoding='utf-8-sig')
     pairs = []
 
     # Group by situation_id
@@ -320,37 +416,23 @@ def load_validation_pairs(csv_path: str) -> list[ValidationPair]:
         allowed_labels = extract_option_labels(prompt_text)
 
         # Get chosen labels
-        chosen_set = parse_label_field_to_set(first_row['cooperate_correct_labels'])
+        chosen_set = parse_label_field_to_set(first_row[mode.chosen_col])
         if not chosen_set:
             continue
-        chosen_label = sorted(list(chosen_set))[0]  # Pick first if multiple
 
         # Get rejected labels
-        rejected_set = parse_label_field_to_set(first_row['cooperate_incorrect_labels'])
+        rejected_set = parse_label_field_to_set(first_row[mode.rejected_col])
         if not rejected_set:
             continue
 
-        # Get CARA_alpha_0_10_best_labels for the situation (same for all options)
-        cara_010_labels = parse_label_field_to_set(first_row.get('CARA_alpha_0_10_best_labels', None))
+        if mode.fixed_rejected_type is not None:
+            # Fixed rejected type: one pair per situation, randomly pick labels
+            rng = random.Random(seed + situation_id)
+            chosen_label = rng.choice(sorted(list(chosen_set)))
+            rejected_label = rng.choice(sorted(list(rejected_set)))
 
-        # Build option index to row mapping - support both letter (a,b,c) and number (1,2,3) labels
-        option_rows = {}
-        for _, row in group.iterrows():
-            idx = int(row['option_index'])
-            # Map both letter and 1-indexed number to the same row
-            option_rows[get_option_letter(idx)] = row  # a, b, c, ...
-            option_rows[get_option_number(idx)] = row  # 1, 2, 3, ...
-
-        # Process each rejected option
-        for rejected_label in sorted(rejected_set):
-            if rejected_label not in option_rows:
-                continue
-
-            rejected_row = option_rows[rejected_label]
-            rejected_type = determine_rejected_type(rejected_row, rejected_label, cara_010_labels)
-
-            if rejected_type is None:
-                # Skip this option - can't determine rejected type
+            # Skip if chosen and rejected are the same option
+            if chosen_label == rejected_label:
                 continue
 
             pairs.append(ValidationPair(
@@ -358,9 +440,42 @@ def load_validation_pairs(csv_path: str) -> list[ValidationPair]:
                 prompt_text=prompt_text,
                 chosen_label=chosen_label,
                 rejected_label=rejected_label,
-                rejected_type=rejected_type,
+                rejected_type=mode.fixed_rejected_type,
                 allowed_labels=allowed_labels
             ))
+        else:
+            # Cooperate mode: determine rejected_type per option, multiple pairs possible
+            chosen_label = sorted(list(chosen_set))[0]  # Pick first if multiple
+
+            # Get CARA_alpha_0_10_best_labels for the situation (same for all options)
+            cara_010_labels = parse_label_field_to_set(first_row.get('CARA_alpha_0_10_best_labels', None))
+
+            # Build option index to row mapping
+            option_rows = {}
+            for _, row in group.iterrows():
+                idx = int(row['option_index'])
+                option_rows[get_option_letter(idx)] = row  # a, b, c, ...
+                option_rows[get_option_number(idx)] = row  # 1, 2, 3, ...
+
+            # Process each rejected option
+            for rejected_label in sorted(rejected_set):
+                if rejected_label not in option_rows:
+                    continue
+
+                rejected_row = option_rows[rejected_label]
+                rejected_type = determine_rejected_type(rejected_row, rejected_label, cara_010_labels)
+
+                if rejected_type is None:
+                    continue
+
+                pairs.append(ValidationPair(
+                    situation_id=situation_id,
+                    prompt_text=prompt_text,
+                    chosen_label=chosen_label,
+                    rejected_label=rejected_label,
+                    rejected_type=rejected_type,
+                    allowed_labels=allowed_labels
+                ))
 
     return pairs
 
@@ -391,7 +506,12 @@ def sample_representative_pairs(pairs: List[ValidationPair], n: int = 20, seed: 
     # Calculate proportional split
     total = len(lin_pairs) + len(too_risk_pairs)
     lin_ratio = len(lin_pairs) / total if total > 0 else 0.5
-    n_lin = max(1, round(n * lin_ratio))
+    n_lin = round(n * lin_ratio)
+    # Ensure at least 1 of each type if available
+    if lin_pairs and n_lin == 0:
+        n_lin = 1
+    if too_risk_pairs and n_lin == n:
+        n_lin = n - 1
     n_too_risk = n - n_lin
 
     # Ensure we don't request more than available
@@ -493,7 +613,7 @@ async def generate_one(client: anthropic.AsyncAnthropic, lottery_prompt: str, sy
     if allowed_labels:
         constraints.append(f"Valid option labels are exactly: {allowed_labels}. Your JSON answer value must be exactly one of these labels (case-sensitive).")
     constraints.append('Use ASCII ONLY: "*" for multiply, "~" for approx, "->" for arrows, "-" or "--" for dashes, quotes \' and ". Do not use Unicode symbols.')
-    constraints.append('You MUST end your message with exactly:</think>\n\n{"answer":"X"}')
+    constraints.append('You MUST end your message with exactly:</think>\n{"answer":"X"} — no text, explanation, or summary between </think> and the JSON.')
     constraints.append(f"Keep your entire reply comfortably UNDER {MAX_TOKENS} output tokens.")
 
     initial_user_text = base_user + "\n\n" + "\n".join(constraints)
@@ -546,12 +666,20 @@ async def generate_one(client: anthropic.AsyncAnthropic, lottery_prompt: str, sy
             if stop_reason in {"max_tokens", "length"} or (out_tokens is not None and out_tokens > MAX_TOKENS):
                 user_text += (
                     f"\nLENGTH FIX: Your last reply was too long or got cut off. Rewrite it shorter to finish well before {MAX_TOKENS} output tokens. "
-                    f"Still include ONE <think>...</think>, then end exactly with </think>\n\n{{\"answer\":\"{expected_label or 'X'}\"}}."
+                    f"Still include ONE <think>...</think>, then end exactly with </think>\n{{\"answer\":\"{expected_label or 'X'}\"}} with NO text between </think> and the JSON."
+                )
+            elif "instruction_leak_in_think" in reasons:
+                user_text += (
+                    "\nREWRITE: Your reasoning contains references to instructions or being told what to do. "
+                    "You must NEVER use phrases like 'as instructed', 'the instruction says', 'I was told', "
+                    "'probability key/table', 'given utility function', 'following instructions', or 'verbal probabilities'. "
+                    "Present ALL reasoning as your own independent mathematical analysis — you chose this utility "
+                    "function yourself, you converted probabilities yourself. Rewrite your full response from scratch."
                 )
             else:
                 user_text += (
-                    "\nFORMAT FIX: Use exactly one <think>...</think> block, then end EXACTLY with </think> then a blank line then ONLY {\"answer\":\""
-                    + (expected_label or "X") + "\"} and nothing after."
+                    "\nFORMAT FIX: Use exactly one <think>...</think> block, then IMMEDIATELY after </think> output ONLY {\"answer\":\""
+                    + (expected_label or "X") + "\"} — no sentences, no explanation, no text between </think> and the JSON."
                 )
         elif is_answer_mismatch and expected_label is not None:
             # Answer mismatch: escalate through strategies
@@ -797,6 +925,27 @@ def parse_args():
         description="Generate Chain-of-Thought (CoT) data for the validation set."
     )
     parser.add_argument(
+        "--mode",
+        type=str,
+        default="cooperate",
+        choices=list(PAIRING_MODES.keys()),
+        help="Pairing mode: 'cooperate' (val set, cooperate labels), "
+             "'cara_vs_010' (CARA 0.01 vs CARA 0.10), "
+             "'cara_vs_linear' (CARA 0.01 vs linear)"
+    )
+    parser.add_argument(
+        "--input",
+        type=str,
+        default=INPUT_CSV,
+        help=f"Input CSV file path (default: {INPUT_CSV})"
+    )
+    parser.add_argument(
+        "--output",
+        type=str,
+        default=None,
+        help="Output CSV file path (default: derived from input filename)"
+    )
+    parser.add_argument(
         "--sample",
         nargs="?",
         const=20,
@@ -824,9 +973,22 @@ async def main():
 
     client = anthropic.AsyncAnthropic(api_key=api_key)
 
+    # Resolve input/output paths
+    input_csv = args.input
+    if args.output:
+        base_output_csv = args.output
+    else:
+        # Derive output name from input: add "_CoTs_from_Sonnet" before .csv
+        stem = Path(input_csv).stem
+        base_output_csv = str(Path(input_csv).parent / f"{stem}_CoTs_from_Sonnet.csv")
+
+    # Resolve pairing mode
+    mode = PAIRING_MODES[args.mode]
+    print(f"Pairing mode: {mode.name} (chosen={mode.chosen_col}, rejected={mode.rejected_col})")
+
     # Load validation pairs
-    print(f"Loading validation data from {INPUT_CSV}...")
-    all_pairs = load_validation_pairs(INPUT_CSV)
+    print(f"Loading validation data from {input_csv}...")
+    all_pairs = load_validation_pairs(input_csv, mode=mode, seed=args.seed)
     print(f"Found {len(all_pairs)} valid (chosen, rejected) pairs")
 
     # Count by rejected type
@@ -838,7 +1000,7 @@ async def main():
     # Apply sampling if requested
     if args.sample:
         pairs = sample_representative_pairs(all_pairs, n=args.sample, seed=args.seed)
-        output_csv = OUTPUT_CSV.replace(".csv", f"_sample_{args.sample}.csv")
+        output_csv = base_output_csv.replace(".csv", f"_sample_{args.sample}.csv")
         print(f"\n*** SAMPLE MODE: Selected {len(pairs)} representative pairs ***")
         sampled_lin = sum(1 for p in pairs if p.rejected_type == "lin")
         sampled_too_risk = sum(1 for p in pairs if p.rejected_type == "too_risk")
@@ -847,7 +1009,7 @@ async def main():
         print(f"  - {unique_situations} unique situations")
     else:
         pairs = all_pairs
-        output_csv = OUTPUT_CSV
+        output_csv = base_output_csv
 
     # Check for existing checkpoint
     done_ids = set()

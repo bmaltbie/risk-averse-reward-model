@@ -456,7 +456,7 @@ def main():
     parser.add_argument(
         "--val_csv",
         type=str,
-        default="data/2026-01-29, New merged val set with Rebels and Steals.csv",
+        default="data/2026_03_22_reward_model_val_set_400_Rebels_clean.csv",
         help="Validation CSV file path",
     )
     parser.add_argument(

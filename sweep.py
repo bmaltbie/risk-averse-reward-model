@@ -62,8 +62,8 @@ class SweepConfig:
     lora_target_modules: List[str] = field(default_factory=lambda: ["q_proj", "v_proj"])
     # Fixed params
     model_name: str = "Qwen/Qwen3-8B"
-    batch_size: int = 2
-    gradient_accumulation_steps: int = 32
+    batch_size: int = 1
+    gradient_accumulation_steps: int = 64
     num_epochs: int = 10
     weight_decay: float = 0.01
     max_length: int = 256
@@ -71,7 +71,7 @@ class SweepConfig:
     random_seed: int = 42
     # CoT training options
     use_cot: bool = True
-    cot_max_length: int = 1024  # Reduced for memory efficiency (actual usage ~515 tokens)
+    cot_max_length: int = 768  # Fits 40GB A100 (actual usage ~515 tokens)
     # Learning rate scheduler
     use_lr_scheduler: bool = True
     warmup_ratio: float = 0.05  # 5% of total steps for warmup
@@ -85,6 +85,9 @@ class SweepConfig:
     reward_head_init_std: float = 0.01  # Std dev for reward head weight init
     # Evaluation
     eval_batch_size: int = 4  # Batch size for evaluation (no gradients, can be larger)
+    # OOD validation filtering
+    ood_val_num_situations: int = 200  # Limit OOD val set size for faster sweeps
+    ood_val_rejected_type: str = "lin"  # Only validate on this rejected_type (None = no filter)
     # Reward model evaluation (post-training, uses evaluate_reward_model.py)
     run_reward_eval: bool = True
     reward_eval_num_situations: int = 50
@@ -103,6 +106,7 @@ SWEEP_CONFIGS = [
     SweepConfig(name="cot_lr_5e-4", learning_rate=5e-4),
     SweepConfig(name="cot_lora_r4", lora_r=4, lora_alpha=8),
     SweepConfig(name="cot_lora_r16", lora_r=16, lora_alpha=32),
+    SweepConfig(name="cot_lora_r32", lora_r=32, lora_alpha=64),
     # Reward head LR multiplier ablation
     SweepConfig(name="head_mult_1.0x", reward_head_lr_multiplier=1.0),
     SweepConfig(name="head_mult_2.0x", reward_head_lr_multiplier=2.0),
@@ -111,11 +115,11 @@ SWEEP_CONFIGS = [
 
 # Data file paths
 # The CoT training file has 1000 situations with both CoT columns and answer labels
-COT_TRAIN_DATA_FILE = "data/2026_01_29_new_full_training_set_with_CoTs_Sonnet_4_5.csv"
+COT_TRAIN_DATA_FILE = "data/2026_03_22_low_stakes_training_set_1000_situations_with_CoTs.csv"
 TRAIN_DATA_FILE = COT_TRAIN_DATA_FILE  # Same file; label-only mode drops CoT columns
 # Validation files: CoT version for CoT training, cooperate-labels version for label-only
-COT_VAL_DATA_FILE = "data/2026_02_11_val_set_CoTs_from_Sonnet.csv"
-LABEL_VAL_DATA_FILE = "data/2026-01-29, New merged val set with Rebels and Steals.csv"
+COT_VAL_DATA_FILE = "data/2026_03_22_reward_model_val_set_400_Rebels_clean.csv"
+LABEL_VAL_DATA_FILE = "data/2026_03_22_reward_model_val_set_400_Rebels_clean.csv"
 VAL_DATA_FILE = COT_VAL_DATA_FILE  # Default (overridden per-config in training function)
 DEFAULT_OUTPUT_DIR = "outputs/sweeps"
 
@@ -769,10 +773,10 @@ def evaluate_model(model, dataset, device, batch_size=4):
 # ============================================================
 # GENERATIVE EVALUATION
 # ============================================================
-# Path to the eval repo submodule
-EVAL_REPO_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "eval", "risk-averse-ai-eval")
-EVAL_SCRIPT = os.path.join(EVAL_REPO_DIR, "evaluate_reward_model.py")
-EVAL_VAL_CSV = os.path.join(EVAL_REPO_DIR, "data", "2026_01_29_new_val_set_probabilities_add_to_100.csv")
+# Reward model eval script and data (project root, not eval submodule)
+_PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+EVAL_SCRIPT = os.path.join(_PROJECT_ROOT, "evaluate_reward_model.py")
+EVAL_VAL_CSV = os.path.join(_PROJECT_ROOT, "data", "2026_03_22_reward_model_val_set_400_Rebels_clean.csv")
 
 
 def run_reward_model_evaluation(config: SweepConfig, checkpoint_dir: str, output_dir: str, device: torch.device) -> Optional[dict]:
@@ -928,14 +932,25 @@ def train_single_run(config: SweepConfig, output_dir: str, device: torch.device)
     if in_dist_val_df.empty:
         raise ValueError(f"In-distribution validation data is empty after processing. Check data file and situation ID split.")
 
-    # Out-dist validation: CoT format uses CoT val file, label-only uses cooperate-labels val file
-    if config.use_cot:
-        out_dist_val_loader = CoTTrainingDataLoader(out_dist_val_file, random_seed=config.random_seed)
-    else:
-        out_dist_val_loader = ValidationDataLoader(out_dist_val_file, random_seed=config.random_seed)
+    # Out-dist validation: always use CoTTrainingDataLoader since val set is in pairwise CoT format
+    out_dist_val_loader = CoTTrainingDataLoader(out_dist_val_file, random_seed=config.random_seed)
     out_dist_val_df = out_dist_val_loader.load_and_process_data()
     if out_dist_val_df.empty:
         raise ValueError(f"Out-of-distribution validation data is empty after processing '{out_dist_val_file}'. Check data file.")
+
+    # Filter OOD val by rejected_type and limit number of situations for faster sweeps
+    if config.ood_val_rejected_type and 'error_type' in out_dist_val_df.columns:
+        # error_type mapping: 'lin' rejected_type → 'too_risky' error_type, 'too_risk' → 'too_risk_averse'
+        target_error_type = 'too_risky' if config.ood_val_rejected_type == 'lin' else 'too_risk_averse'
+        before = len(out_dist_val_df)
+        out_dist_val_df = out_dist_val_df[out_dist_val_df['error_type'] == target_error_type].reset_index(drop=True)
+        print(f"  OOD val filtered to error_type='{target_error_type}': {before} → {len(out_dist_val_df)} pairs")
+    if config.ood_val_num_situations and config.ood_val_num_situations < len(out_dist_val_df):
+        rng = np.random.default_rng(config.random_seed)
+        sit_ids = out_dist_val_df['situation_id'].unique()
+        chosen_ids = rng.choice(sit_ids, size=config.ood_val_num_situations, replace=False)
+        out_dist_val_df = out_dist_val_df[out_dist_val_df['situation_id'].isin(chosen_ids)].reset_index(drop=True)
+        print(f"  OOD val limited to {config.ood_val_num_situations} situations: {len(out_dist_val_df)} pairs")
 
     # For label-only mode, drop CoT columns so PairwiseRewardDataset uses label format
     if not config.use_cot:
