@@ -12,6 +12,13 @@
 
 set -e
 
+# ------------------------------------------------------------
+# 0. Optional: HuggingFace access token
+# ------------------------------------------------------------
+# Required only for gated models (e.g., meta-llama/*). Qwen3 is public and
+# needs no token. To enable, edit the line below and uncomment.
+# export HF_TOKEN="hf_your_token_here"
+
 echo "=== Setting up environment ==="
 
 # ------------------------------------------------------------
@@ -69,11 +76,15 @@ pip install -r requirements.txt
 # 3. Summary
 # ------------------------------------------------------------
 submodule_sha="$(git -C "${SUBMODULE_PATH}" rev-parse --short HEAD 2>/dev/null || echo '?')"
+hf_token_status="not set (Qwen3 is public — fine)"
+if [ -n "${HF_TOKEN:-}" ]; then hf_token_status="set"; fi
+
 echo ""
 echo "=== Setup complete ==="
 echo "Virtual environment: .venv (activated)"
 echo "Submodule:           ${SUBMODULE_PATH} @ ${submodule_sha}"
 echo "CSVs present:        $((${#REQUIRED_CSVS[@]} - missing_csvs)) / ${#REQUIRED_CSVS[@]}"
+echo "HF_TOKEN:            ${hf_token_status}"
 echo ""
 echo "Next: python rft_pipeline.py --dry_run"
 echo ""
