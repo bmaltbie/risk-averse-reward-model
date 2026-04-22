@@ -15,10 +15,12 @@ Usage:
 # ============================================================
 import os
 import sys
+import gc
 import json
 import time
 import argparse
 import subprocess
+import traceback
 from datetime import datetime
 from dataclasses import dataclass, asdict, field
 from typing import List, Dict, Optional, Tuple
@@ -34,6 +36,10 @@ from transformers import AutoTokenizer, AutoModel, get_cosine_schedule_with_warm
 from peft import LoraConfig, get_peft_model, TaskType
 from sklearn.model_selection import train_test_split
 import matplotlib.pyplot as plt
+
+
+class OOMSkipRun(RuntimeError):
+    """Raised when a soft OOM should abort the current sweep config and continue with the next."""
 
 
 def set_seed(seed: int):
@@ -54,18 +60,18 @@ def set_seed(seed: int):
 class SweepConfig:
     """Configuration for a single training run."""
     name: str
-    learning_rate: float = 2e-4
-    reward_head_lr_multiplier: float = 2.5  # Reward head LR = learning_rate * this
-    lora_r: int = 8
-    lora_alpha: int = 16
+    learning_rate: float = 1e-4
+    reward_head_lr_multiplier: float = 1.0  # Reward head LR = learning_rate * this
+    lora_r: int = 32
+    lora_alpha: int = 64
     lora_dropout: float = 0.05
-    lora_target_modules: List[str] = field(default_factory=lambda: ["q_proj", "v_proj"])
+    lora_target_modules: List[str] = field(default_factory=lambda: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"])
     # Fixed params
     model_name: str = "Qwen/Qwen3-8B"
     batch_size: int = 1
     gradient_accumulation_steps: int = 64
     num_epochs: int = 10
-    weight_decay: float = 0.01
+    weight_decay: float = 0.05
     max_length: int = 256
     in_dist_val_split: float = 0.10
     random_seed: int = 42
@@ -74,17 +80,19 @@ class SweepConfig:
     cot_max_length: int = 768  # Fits 40GB A100 (actual usage ~515 tokens)
     # Learning rate scheduler
     use_lr_scheduler: bool = True
-    warmup_ratio: float = 0.05  # 5% of total steps for warmup
+    warmup_ratio: float = 0.10  # 10% of total steps for warmup
     # Gradient clipping
     use_gradient_clipping: bool = True
     max_grad_norm: float = 1.0  # Standard default for LLM training
     # Reference model for KL regularization
     use_reference_model: bool = True
-    reference_kl_beta: float = 0.1  # KL penalty weight (0 = monitoring only)
+    reference_kl_beta: float = 0.2  # KL penalty weight (0 = monitoring only)
     # Model initialization
     reward_head_init_std: float = 0.01  # Std dev for reward head weight init
     # Evaluation
     eval_batch_size: int = 4  # Batch size for evaluation (no gradients, can be larger)
+    # Early stopping (0 = disabled). Watches out_dist validation accuracy per epoch.
+    early_stopping_patience: int = 2
     # OOD validation filtering
     ood_val_num_situations: int = 200  # Limit OOD val set size for faster sweeps
     ood_val_rejected_type: str = "lin"  # Only validate on this rejected_type (None = no filter)
@@ -97,16 +105,16 @@ class SweepConfig:
 # Note: use_cot defaults to True, so label-only configs explicitly set use_cot=False
 SWEEP_CONFIGS = [
     # Label-only configurations (for comparison)
-    SweepConfig(name="label_lr_1e-4", learning_rate=1e-4, use_cot=False),
-    SweepConfig(name="label_lr_2e-4", learning_rate=2e-4, use_cot=False),  # label-only baseline
+    SweepConfig(name="label_lr_5e-5", learning_rate=5e-5, use_cot=False),
+    SweepConfig(name="label_lr_1e-4", learning_rate=1e-4, use_cot=False),  # label-only baseline
     # CoT (Chain-of-Thought) configurations - default
+    SweepConfig(name="cot_lr_2e-5", learning_rate=2e-5),
     SweepConfig(name="cot_lr_5e-5", learning_rate=5e-5),
-    SweepConfig(name="cot_lr_1e-4", learning_rate=1e-4),
-    SweepConfig(name="cot_lr_2e-4", learning_rate=2e-4),  # CoT baseline
-    SweepConfig(name="cot_lr_5e-4", learning_rate=5e-4),
-    SweepConfig(name="cot_lora_r4", lora_r=4, lora_alpha=8),
+    SweepConfig(name="cot_lr_1e-4", learning_rate=1e-4),  # CoT baseline
+    SweepConfig(name="cot_lr_2e-4", learning_rate=2e-4),
+    SweepConfig(name="cot_lora_r8", lora_r=8, lora_alpha=16),
     SweepConfig(name="cot_lora_r16", lora_r=16, lora_alpha=32),
-    SweepConfig(name="cot_lora_r32", lora_r=32, lora_alpha=64),
+    SweepConfig(name="cot_lora_r64", lora_r=64, lora_alpha=128),
     # Reward head LR multiplier ablation
     SweepConfig(name="head_mult_1.0x", reward_head_lr_multiplier=1.0),
     SweepConfig(name="head_mult_2.0x", reward_head_lr_multiplier=2.0),
@@ -118,8 +126,8 @@ SWEEP_CONFIGS = [
 COT_TRAIN_DATA_FILE = "data/2026_03_22_low_stakes_training_set_1000_situations_with_CoTs.csv"
 TRAIN_DATA_FILE = COT_TRAIN_DATA_FILE  # Same file; label-only mode drops CoT columns
 # Validation files: CoT version for CoT training, cooperate-labels version for label-only
-COT_VAL_DATA_FILE = "data/2026_03_22_reward_model_val_set_400_Rebels_clean.csv"
-LABEL_VAL_DATA_FILE = "data/2026_03_22_reward_model_val_set_400_Rebels_clean.csv"
+COT_VAL_DATA_FILE = "data/2026_03_22_reward_model_val_set_500_Rebels.csv"
+LABEL_VAL_DATA_FILE = "data/2026_03_22_reward_model_val_set_500_Rebels.csv"
 VAL_DATA_FILE = COT_VAL_DATA_FILE  # Default (overridden per-config in training function)
 DEFAULT_OUTPUT_DIR = "outputs/sweeps"
 
@@ -601,8 +609,8 @@ class RewardModel(nn.Module):
     def __init__(
         self,
         model_name: str = "Qwen/Qwen3-8B",
-        lora_r: int = 8,
-        lora_alpha: int = 16,
+        lora_r: int = 32,
+        lora_alpha: int = 64,
         lora_dropout: float = 0.05,
         lora_target_modules: list = None,
         reward_head_init_std: float = 0.01,
@@ -622,7 +630,7 @@ class RewardModel(nn.Module):
         nn.init.zeros_(self.reward_head.bias)
 
         if lora_target_modules is None:
-            lora_target_modules = ["q_proj", "v_proj"]
+            lora_target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 
         lora_config = LoraConfig(
             r=lora_r,
@@ -698,10 +706,20 @@ def compute_reference_rewards(reference_head, last_hidden_states):
         return reference_head(last_hidden_states.detach()).squeeze(-1)
 
 
-def evaluate_model(model, dataset, device, batch_size=4):
-    """Evaluate model on pairwise accuracy."""
+def evaluate_model(model, dataset, device, batch_size=4, verbose=True, desc="eval"):
+    """Evaluate model on pairwise accuracy.
+
+    When verbose=True, prints a progress line every ~10% of batches so that long
+    eval passes (e.g. baseline on the full val set with the 8B backbone) are not silent.
+    """
     model.eval()
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+    n_batches = len(dataloader)
+    log_every = max(1, n_batches // 10)
+    start_t = time.time()
+    oom_skipped = 0
+    if verbose:
+        print(f"  [{desc}] {len(dataset)} pairs in {n_batches} batches (bs={batch_size})...", flush=True)
 
     correct = 0
     total = 0
@@ -712,7 +730,8 @@ def evaluate_model(model, dataset, device, batch_size=4):
     total_by_type = {'too_risky': 0, 'too_risk_averse': 0, 'other': 0}
 
     with torch.no_grad():
-        for batch in dataloader:
+        for batch_idx, batch in enumerate(dataloader):
+            batch_ok = True
             try:
                 preferred_rewards = model(
                     input_ids=batch['preferred_input_ids'].to(device),
@@ -722,33 +741,52 @@ def evaluate_model(model, dataset, device, batch_size=4):
                     input_ids=batch['rejected_input_ids'].to(device),
                     attention_mask=batch['rejected_attention_mask'].to(device)
                 )
-            except RuntimeError as e:
-                if "out of memory" in str(e).lower():
-                    print(f"  WARNING: GPU OOM during evaluation. Clearing cache and skipping batch.")
+            except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
+                msg = str(e).lower()
+                if "out of memory" in msg or "cublas_status_alloc_failed" in msg or isinstance(e, torch.cuda.OutOfMemoryError):
+                    print(f"  [{desc}] WARNING: GPU OOM on batch {batch_idx + 1}/{n_batches}. "
+                          f"Aborting this run.", flush=True)
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
-                    continue
-                raise
+                    raise OOMSkipRun(f"OOM during {desc} batch {batch_idx + 1}") from e
+                else:
+                    raise
 
-            loss = bradley_terry_loss(preferred_rewards, rejected_rewards)
-            total_loss += loss.item() * len(preferred_rewards)
+            if batch_ok:
+                loss = bradley_terry_loss(preferred_rewards, rejected_rewards)
+                total_loss += loss.item() * len(preferred_rewards)
 
-            is_correct = (preferred_rewards > rejected_rewards)
-            correct += is_correct.sum().item()
-            total += len(preferred_rewards)
+                is_correct = (preferred_rewards > rejected_rewards)
+                correct += is_correct.sum().item()
+                total += len(preferred_rewards)
 
-            preferred_scores.extend(preferred_rewards.cpu().float().numpy().tolist())
-            rejected_scores.extend(rejected_rewards.cpu().float().numpy().tolist())
+                preferred_scores.extend(preferred_rewards.cpu().float().numpy().tolist())
+                rejected_scores.extend(rejected_rewards.cpu().float().numpy().tolist())
 
-            if 'error_type' in batch:
-                for i, error_type in enumerate(batch['error_type']):
-                    if error_type in total_by_type:
-                        total_by_type[error_type] += 1
-                        if is_correct[i].item():
-                            correct_by_type[error_type] += 1
+                if 'error_type' in batch:
+                    for i, error_type in enumerate(batch['error_type']):
+                        if error_type in total_by_type:
+                            total_by_type[error_type] += 1
+                            if is_correct[i].item():
+                                correct_by_type[error_type] += 1
+
+            # Progress print runs for EVERY batch outcome (ok or OOM-skipped), so
+            # a silent hang is distinguishable from a storm of OOMs. First 3 batches
+            # print unconditionally to confirm liveness; after that, every ~10%.
+            if verbose and (batch_idx < 3 or (batch_idx + 1) % log_every == 0 or batch_idx == n_batches - 1):
+                elapsed = time.time() - start_t
+                running_acc = correct / max(total, 1)
+                pct = 100.0 * (batch_idx + 1) / n_batches
+                oom_note = f" oom_skipped={oom_skipped}" if oom_skipped else ""
+                print(f"  [{desc}] batch {batch_idx + 1}/{n_batches} ({pct:5.1f}%) "
+                      f"acc={running_acc:.3f} elapsed={elapsed:.1f}s{oom_note}", flush=True)
 
     accuracy = correct / total if total > 0 else 0.0
     avg_loss = total_loss / total if total > 0 else 0.0
+    if verbose:
+        oom_note = f" (OOM-skipped {oom_skipped}/{n_batches} batches)" if oom_skipped else ""
+        print(f"  [{desc}] done in {time.time() - start_t:.1f}s — "
+              f"final acc={accuracy:.4f} loss={avg_loss:.4f}{oom_note}", flush=True)
 
     error_type_breakdown = {}
     for error_type in ['too_risky', 'too_risk_averse', 'other']:
@@ -773,70 +811,76 @@ def evaluate_model(model, dataset, device, batch_size=4):
 # ============================================================
 # GENERATIVE EVALUATION
 # ============================================================
-# Reward model eval script and data (project root, not eval submodule)
+# Reward model eval script (upstream submodule) and data
+# We rely on eval/risk-averse-ai-eval/evaluate_reward_model.py for pairwise
+# scoring of (chosen_full, rejected_full) CoT transcripts.
+#
+# We run TWO evals per checkpoint:
+#   - clean_400: upstream's canonical 400-row alias (audited; externally comparable)
+#   - rebels_500: the raw 500-row file (includes 82 audit-flagged rows; absolute
+#                 score deflated by ~10-15pts but useful for tracking how well a
+#                 model handles noisy/ambiguous "preferred" CoTs)
 _PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
-EVAL_SCRIPT = os.path.join(_PROJECT_ROOT, "evaluate_reward_model.py")
-EVAL_VAL_CSV = os.path.join(_PROJECT_ROOT, "data", "2026_03_22_reward_model_val_set_400_Rebels_clean.csv")
+EVAL_SCRIPT = os.path.join(_PROJECT_ROOT, "eval", "risk-averse-ai-eval", "evaluate_reward_model.py")
+EVAL_VAL_CSV_500 = os.path.join(_PROJECT_ROOT, "data", "2026_03_22_reward_model_val_set_500_Rebels.csv")
+# Each spec: (key, label, csv_path_or_None, dataset_alias_or_None)
+# csv_path takes precedence; dataset_alias is resolved by the upstream script.
+REWARD_EVAL_SPECS = [
+    ("clean_400", "400 (clean)", None, "reward_model_validation"),
+    ("rebels_500", "500 (raw)", EVAL_VAL_CSV_500, None),
+]
 
 
-def run_reward_model_evaluation(config: SweepConfig, checkpoint_dir: str, output_dir: str, device: torch.device) -> Optional[dict]:
-    """Run reward model evaluation using evaluate_reward_model.py on saved checkpoint.
+def _run_single_reward_eval(
+    config: SweepConfig,
+    checkpoint_dir: str,
+    output_dir: str,
+    eval_key: str,
+    eval_label: str,
+    csv_path: Optional[str],
+    dataset_alias: Optional[str],
+    max_length: int,
+) -> Optional[dict]:
+    """Invoke upstream evaluate_reward_model.py once and parse its summary."""
+    output_json = os.path.join(output_dir, f"reward_eval_results_{eval_key}.json")
 
-    Scores every option in each situation via the reward model and selects argmax.
-    This is the correct evaluation approach for reward models (not generative eval).
-
-    Returns a summary dict with key metrics, or None if evaluation could not run.
-    """
-    if not os.path.isfile(EVAL_SCRIPT):
-        print(f"  WARNING: Reward eval skipped - eval script not found at {EVAL_SCRIPT}")
-        print(f"  To enable: git submodule update --init")
-        return None
-
-    if not os.path.isfile(EVAL_VAL_CSV):
-        print(f"  WARNING: Reward eval skipped - val CSV not found at {EVAL_VAL_CSV}")
-        return None
-
-    if not os.path.isdir(checkpoint_dir):
-        print(f"  WARNING: Reward eval skipped - checkpoint not found at {checkpoint_dir}")
-        return None
-
-    output_json = os.path.join(output_dir, "reward_eval_results.json")
-
-    # Use cot_max_length for CoT models, max_length otherwise
-    max_length = config.cot_max_length if config.use_cot else config.max_length
-
+    # Upstream CLI:
+    #   --model_path  : PEFT adapter path (LoRA + reward head checkpoint)
+    #   --base_model  : base HF model id
+    #   --custom_csv  : pairwise CoT CSV (prompt_text/chosen_full/rejected_full)
+    #   --dataset     : built-in alias (resolved against submodule's data/ dir)
+    #   --num_pairs   : cap on dedup'd pair rows to score
+    #   --batch_size  : pairs scored in parallel
     cmd = [
         sys.executable, EVAL_SCRIPT,
-        "--checkpoint_path", checkpoint_dir,
+        "--model_path", checkpoint_dir,
         "--base_model", config.model_name,
-        "--val_csv", EVAL_VAL_CSV,
-        "--num_situations", str(config.reward_eval_num_situations),
+        "--num_pairs", str(config.reward_eval_num_situations),
         "--max_length", str(max_length),
-        "--eval_batch_size", str(config.eval_batch_size),
+        "--batch_size", str(config.eval_batch_size),
         "--output", output_json,
     ]
+    if csv_path:
+        cmd += ["--custom_csv", csv_path]
+        dataset_descr = os.path.basename(csv_path)
+    else:
+        cmd += ["--dataset", dataset_alias]
+        dataset_descr = dataset_alias
 
-    print(f"\n  Running reward model evaluation ({config.reward_eval_num_situations} situations, max_length={max_length})...")
-    print(f"  Command: {' '.join(cmd)}")
+    print(f"\n  [{eval_label}] running ({config.reward_eval_num_situations} pairs, max_length={max_length}, dataset={dataset_descr})...")
 
     try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=1800,  # 30 minute timeout
-        )
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
 
         if result.returncode != 0:
-            print(f"  WARNING: Reward eval failed (exit code {result.returncode})")
+            print(f"  [{eval_label}] WARNING: failed (exit code {result.returncode})")
             if result.stderr:
-                stderr_lines = result.stderr.strip().split('\n')
-                for line in stderr_lines[-20:]:
+                for line in result.stderr.strip().split('\n')[-20:]:
                     print(f"    {line}")
             return None
 
         if not os.path.isfile(output_json):
-            print(f"  WARNING: Reward eval produced no output file")
+            print(f"  [{eval_label}] WARNING: produced no output file")
             return None
 
         with open(output_json, 'r') as f:
@@ -844,34 +888,67 @@ def run_reward_model_evaluation(config: SweepConfig, checkpoint_dir: str, output
 
         metrics = eval_results.get('metrics', {})
         summary = {
-            'cara_rate': metrics.get('best_cara_rate', None),
-            'parse_rate': metrics.get('parse_rate', None),
-            'cooperate_rate': metrics.get('cooperate_rate', None),
-            'rebel_rate': metrics.get('rebel_rate', None),
-            'steal_rate': metrics.get('steal_rate', None),
-            'best_linear_rate': metrics.get('best_linear_rate', None),
-            'num_situations': eval_results.get('num_total', config.reward_eval_num_situations),
-            'num_valid': eval_results.get('num_valid', None),
-            'eval_dataset': os.path.basename(EVAL_VAL_CSV),
+            'pairwise_accuracy': metrics.get('pairwise_accuracy', None),
+            'pairwise_accuracy_ties_half_credit': metrics.get('pairwise_accuracy_ties_half_credit', None),
+            'tie_rate': metrics.get('tie_rate', None),
+            'preference_log_loss': metrics.get('preference_log_loss', None),
+            'mean_score_margin': metrics.get('mean_score_margin', None),
+            'mean_accepted_score': metrics.get('mean_accepted_score', None),
+            'mean_rejected_score': metrics.get('mean_rejected_score', None),
+            'truncated_pair_rate': metrics.get('truncated_pair_rate', None),
+            'num_pairs': eval_results.get('num_total', config.reward_eval_num_situations),
+            'num_correct': eval_results.get('num_correct', None),
+            'num_ties': eval_results.get('num_ties', 0) or 0,
+            'eval_dataset': dataset_descr,
         }
 
-        cara = summary['cara_rate']
-        parse = summary['parse_rate']
-        print(f"  Reward eval complete:")
-        print(f"    CARA rate: {cara:.3f}" if cara is not None else "    CARA rate: N/A")
-        print(f"    Parse rate: {parse:.3f}" if parse is not None else "    Parse rate: N/A")
-        print(f"    Cooperate: {summary['cooperate_rate']}" if summary['cooperate_rate'] is not None else "")
-        print(f"    Rebel: {summary['rebel_rate']}" if summary['rebel_rate'] is not None else "")
-        print(f"    Steal: {summary['steal_rate']}" if summary['steal_rate'] is not None else "")
+        acc = summary['pairwise_accuracy']
+        margin = summary['mean_score_margin']
+        tie = summary['tie_rate']
+        print(f"  [{eval_label}] pairwise_acc={acc:.3f}" if acc is not None else f"  [{eval_label}] pairwise_acc=N/A",
+              end="")
+        print(f"  margin={margin:+.4f}" if margin is not None else "  margin=N/A", end="")
+        print(f"  tie_rate={tie:.3f}" if tie is not None else "  tie_rate=N/A", end="")
+        print(f"  ({summary['num_correct']}/{summary['num_pairs']} correct)")
 
         return summary
 
     except subprocess.TimeoutExpired:
-        print(f"  WARNING: Reward eval timed out after 30 minutes")
+        print(f"  [{eval_label}] WARNING: timed out after 30 minutes")
         return None
     except Exception as e:
-        print(f"  WARNING: Reward eval error: {e}")
+        print(f"  [{eval_label}] WARNING: error: {e}")
         return None
+
+
+def run_reward_model_evaluation(config: SweepConfig, checkpoint_dir: str, output_dir: str, device: torch.device) -> Optional[dict]:
+    """Run upstream reward-model eval against every spec in REWARD_EVAL_SPECS.
+
+    Returns a dict keyed by spec name (e.g. {"clean_400": {...}, "rebels_500": {...}})
+    where each value is the per-eval summary. Returns None if no eval ran successfully.
+    """
+    if not os.path.isfile(EVAL_SCRIPT):
+        print(f"  WARNING: Reward eval skipped - eval script not found at {EVAL_SCRIPT}")
+        print(f"  To enable: git submodule update --init --recursive")
+        return None
+    if not os.path.isdir(checkpoint_dir):
+        print(f"  WARNING: Reward eval skipped - checkpoint not found at {checkpoint_dir}")
+        return None
+
+    max_length = config.cot_max_length if config.use_cot else config.max_length
+
+    aggregated = {}
+    for key, label, csv_path, dataset_alias in REWARD_EVAL_SPECS:
+        if csv_path and not os.path.isfile(csv_path):
+            print(f"  [{label}] skipped - CSV not found at {csv_path}")
+            continue
+        summary = _run_single_reward_eval(
+            config, checkpoint_dir, output_dir, key, label, csv_path, dataset_alias, max_length,
+        )
+        if summary is not None:
+            aggregated[key] = summary
+
+    return aggregated or None
 
 
 # ============================================================
@@ -959,6 +1036,8 @@ def train_single_run(config: SweepConfig, output_dir: str, device: torch.device)
                 train_df = train_df.drop(columns=[col])
             if col in in_dist_val_df.columns:
                 in_dist_val_df = in_dist_val_df.drop(columns=[col])
+            if col in out_dist_val_df.columns:
+                out_dist_val_df = out_dist_val_df.drop(columns=[col])
 
     train_dataset = PairwiseRewardDataset(train_df, tokenizer, max_length=train_max_length)
     in_dist_val_dataset = PairwiseRewardDataset(in_dist_val_df, tokenizer, max_length=train_max_length)
@@ -1026,10 +1105,12 @@ def train_single_run(config: SweepConfig, output_dir: str, device: torch.device)
         print(f"Reference Model: KL beta={config.reference_kl_beta}")
 
     # Baseline evaluation
-    print("\nBaseline evaluation...")
+    print("\nBaseline evaluation (untrained reward head)...")
     eval_bs = config.eval_batch_size
-    baseline_out = evaluate_model(model, out_dist_val_dataset, device, batch_size=eval_bs)
-    baseline_in = evaluate_model(model, in_dist_val_dataset, device, batch_size=eval_bs)
+    baseline_out = evaluate_model(model, out_dist_val_dataset, device, batch_size=eval_bs,
+                                  verbose=True, desc="baseline out-dist")
+    baseline_in = evaluate_model(model, in_dist_val_dataset, device, batch_size=eval_bs,
+                                 verbose=True, desc="baseline in-dist")
     print(f"  Baseline out-dist accuracy: {baseline_out['accuracy']:.4f}")
     print(f"  Baseline in-dist accuracy: {baseline_in['accuracy']:.4f}")
 
@@ -1050,6 +1131,7 @@ def train_single_run(config: SweepConfig, output_dir: str, device: torch.device)
 
     best_val_accuracy = 0.0
     best_epoch = 0
+    epochs_without_improvement = 0  # For early stopping
 
     # Training loop
     for epoch in range(config.num_epochs):
@@ -1149,12 +1231,11 @@ def train_single_run(config: SweepConfig, output_dir: str, device: torch.device)
 
             except RuntimeError as e:
                 if "out of memory" in str(e).lower():
-                    print(f"  WARNING: GPU OOM at epoch {epoch+1}, step {step+1}. Clearing cache and skipping batch.")
+                    print(f"  WARNING: GPU OOM at epoch {epoch+1}, step {step+1}. Aborting this run.")
                     optimizer.zero_grad()
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
-                    oom_encountered = True
-                    continue
+                    raise OOMSkipRun(f"OOM at epoch {epoch+1}, step {step+1}") from e
                 raise
 
         if oom_encountered:
@@ -1202,6 +1283,7 @@ def train_single_run(config: SweepConfig, output_dir: str, device: torch.device)
         if out_dist_eval['accuracy'] > best_val_accuracy:
             best_val_accuracy = out_dist_eval['accuracy']
             best_epoch = epoch + 1
+            epochs_without_improvement = 0
             # Save best checkpoint
             checkpoint_dir = os.path.join(output_dir, 'best_checkpoint')
             os.makedirs(checkpoint_dir, exist_ok=True)
@@ -1212,6 +1294,13 @@ def train_single_run(config: SweepConfig, output_dir: str, device: torch.device)
                 'out_dist_accuracy': best_val_accuracy,
             }, os.path.join(checkpoint_dir, 'reward_head.pt'))
             print(f"  New best! Saved checkpoint (epoch {best_epoch}, acc={best_val_accuracy:.4f})")
+        else:
+            epochs_without_improvement += 1
+            if config.early_stopping_patience and epochs_without_improvement >= config.early_stopping_patience:
+                print(f"  Early stopping at epoch {epoch + 1} "
+                      f"(no improvement for {config.early_stopping_patience} epochs; "
+                      f"best={best_val_accuracy:.4f} @ epoch {best_epoch})")
+                break
 
     # Final evaluation
     final_out_eval = evaluate_model(model, out_dist_val_dataset, device, batch_size=eval_bs)
@@ -1302,6 +1391,8 @@ def run_sweep(configs: List[SweepConfig], output_base: str):
     print(f"\nUsing device: {device}")
 
     all_results = []
+    status_records = []
+    status_path = os.path.join(sweep_dir, 'run_status.json')
     sweep_start = time.time()
 
     for i, config in enumerate(configs):
@@ -1310,12 +1401,25 @@ def run_sweep(configs: List[SweepConfig], output_base: str):
         print(f"{'='*60}")
 
         run_dir = os.path.join(sweep_dir, f"run_{i+1}_{config.name}")
+        run_start = time.time()
+        record = {'run_index': i + 1, 'name': config.name, 'status': 'pending'}
         try:
             result = train_single_run(config, run_dir, device)
             result['run_index'] = i + 1
             all_results.append(result)
+            record.update({
+                'status': 'succeeded',
+                'training_time_minutes': result.get('training_time_minutes'),
+                'best_out_dist_accuracy': result.get('trained', {}).get('best_out_dist_accuracy'),
+            })
         except Exception as e:
             print(f"ERROR: Run {config.name} failed: {e}")
+            record.update({
+                'status': 'failed',
+                'error_type': type(e).__name__,
+                'error_message': str(e),
+                'traceback': traceback.format_exc(),
+            })
             all_results.append({
                 'config': asdict(config),
                 'error': str(e),
@@ -1334,6 +1438,22 @@ def run_sweep(configs: List[SweepConfig], output_base: str):
                     'out_dist_validation_label_type': 'CARA CoT (out-of-distribution)' if config.use_cot else 'Cooperate labels (out-of-distribution)',
                 },
             })
+        finally:
+            record['wall_seconds'] = round(time.time() - run_start, 1)
+            status_records.append(record)
+            with open(status_path, 'w') as f:
+                json.dump({
+                    'sweep_dir': sweep_dir,
+                    'updated_at': datetime.now().isoformat(timespec='seconds'),
+                    'total_planned': len(configs),
+                    'completed': len(status_records),
+                    'succeeded': sum(1 for r in status_records if r['status'] == 'succeeded'),
+                    'failed': sum(1 for r in status_records if r['status'] == 'failed'),
+                    'runs': status_records,
+                }, f, indent=2)
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     sweep_elapsed = time.time() - sweep_start
 
@@ -1373,10 +1493,14 @@ def generate_sweep_summary(results: List[dict], sweep_dir: str, total_time: floa
             'best_out_dist_accuracy': r['trained']['best_out_dist_accuracy'],
             'training_time_minutes': r['training_time_minutes'],
         }
-        gen_eval = r.get('reward_eval', {})
-        if gen_eval:
-            entry['cara_rate'] = gen_eval.get('cara_rate')
-            entry['parse_rate'] = gen_eval.get('parse_rate')
+        # reward_eval is a dict keyed by spec name; flatten primary metrics per spec.
+        reward_eval = r.get('reward_eval') or {}
+        for spec_key, spec_summary in reward_eval.items():
+            if not isinstance(spec_summary, dict):
+                continue
+            entry[f'pairwise_accuracy__{spec_key}'] = spec_summary.get('pairwise_accuracy')
+            entry[f'mean_score_margin__{spec_key}'] = spec_summary.get('mean_score_margin')
+            entry[f'tie_rate__{spec_key}'] = spec_summary.get('tie_rate')
         runs_ranked.append(entry)
 
     # Extract data source info from first result
@@ -1401,22 +1525,25 @@ def generate_sweep_summary(results: List[dict], sweep_dir: str, total_time: floa
     with open(os.path.join(sweep_dir, 'sweep_summary.json'), 'w') as f:
         json.dump(summary, f, indent=2)
 
-    # Print summary
-    has_cara = any('cara_rate' in r for r in runs_ranked)
-    print(f"\n{'='*72}")
+    # Print summary — one Pairwise-Acc column per reward-eval spec actually run.
+    spec_keys_present = [k for k, _, _, _ in REWARD_EVAL_SPECS
+                         if any(f'pairwise_accuracy__{k}' in r for r in runs_ranked)]
+    spec_labels = {k: lbl for k, lbl, _, _ in REWARD_EVAL_SPECS}
+
+    print(f"\n{'='*88}")
     print("SWEEP SUMMARY")
-    print(f"{'='*72}")
+    print(f"{'='*88}")
     header = f"{'Rank':<6} {'Name':<15} {'Out-Dist Acc':>12} {'In-Dist Acc':>12}"
-    if has_cara:
-        header += f" {'CARA Rate':>10}"
+    for k in spec_keys_present:
+        header += f" {'PW Acc ' + spec_labels[k]:>14}"
     header += f" {'Time (min)':>10}"
     print(header)
-    print("-" * 72)
+    print("-" * 88)
     for r in runs_ranked:
         line = f"{r['rank']:<6} {r['name']:<15} {r['out_dist_accuracy']:>11.4f} {r['in_dist_accuracy']:>12.4f}"
-        if has_cara:
-            cara = r.get('cara_rate')
-            line += f" {cara:>9.3f}" if cara is not None else f" {'N/A':>9}"
+        for k in spec_keys_present:
+            pw = r.get(f'pairwise_accuracy__{k}')
+            line += f" {pw:>13.3f}" if pw is not None else f" {'N/A':>13}"
         line += f" {r['training_time_minutes']:>10.1f}"
         print(line)
     print(f"\nBest: {runs_ranked[0]['name']} with {runs_ranked[0]['out_dist_accuracy']:.4f} accuracy")
@@ -1428,17 +1555,28 @@ def generate_sweep_summary(results: List[dict], sweep_dir: str, total_time: floa
 
 
 def generate_comparison_plot(results: List[dict], sweep_dir: str):
-    """Generate comparison bar chart with optional CARA rate subplot."""
+    """Generate comparison bar chart with optional reward-eval pairwise-accuracy subplot.
+
+    Second subplot shows one bar group per REWARD_EVAL_SPECS spec (e.g. clean_400 vs
+    rebels_500), so you can see both the externally-comparable score and the noisy-row
+    score side-by-side.
+    """
     names = [r['config']['name'] for r in results]
     out_accs = [r['trained']['out_dist_accuracy'] for r in results]
     in_accs = [r['trained']['in_dist_accuracy'] for r in results]
     baseline_out = results[0]['baseline']['out_dist_accuracy']
 
-    # Check if any results have generative eval data
-    cara_rates = [r.get('reward_eval', {}).get('cara_rate') for r in results]
-    has_cara = any(c is not None for c in cara_rates)
+    # Per-spec pairwise accuracy: dict of spec_key -> list aligned with `results`.
+    pw_by_spec = {}
+    for spec_key, spec_label, _, _ in REWARD_EVAL_SPECS:
+        vals = [(r.get('reward_eval') or {}).get(spec_key, {}).get('pairwise_accuracy')
+                if isinstance((r.get('reward_eval') or {}).get(spec_key), dict) else None
+                for r in results]
+        if any(v is not None for v in vals):
+            pw_by_spec[spec_key] = (spec_label, vals)
+    has_pw = bool(pw_by_spec)
 
-    if has_cara:
+    if has_pw:
         fig, (ax, ax2) = plt.subplots(2, 1, figsize=(12, 10), height_ratios=[3, 2])
     else:
         fig, ax = plt.subplots(figsize=(12, 6))
@@ -1477,37 +1615,42 @@ def generate_comparison_plot(results: List[dict], sweep_dir: str):
         ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.01,
                 f'{val:.3f}', ha='center', va='bottom', fontsize=8)
 
-    # CARA rate subplot
-    if has_cara:
-        # Replace None with 0 for plotting, track which are valid
-        cara_vals = [c if c is not None else 0 for c in cara_rates]
-        cara_colors = ['seagreen' if c is not None else 'lightgray' for c in cara_rates]
+    # Pairwise-accuracy subplot — grouped bars, one group per reward-eval spec.
+    if has_pw:
+        n_specs = len(pw_by_spec)
+        group_width = 0.8
+        bar_w = group_width / n_specs
+        spec_palette = ['seagreen', 'steelblue', 'mediumorchid', 'coral']
 
-        bars3 = ax2.bar(x, cara_vals, width=0.5, color=cara_colors)
+        for i, (spec_key, (spec_label, vals)) in enumerate(pw_by_spec.items()):
+            offsets = x - group_width/2 + bar_w/2 + i*bar_w
+            plot_vals = [v if v is not None else 0 for v in vals]
+            color = spec_palette[i % len(spec_palette)]
+            colors = [color if v is not None else 'lightgray' for v in vals]
+            bars = ax2.bar(offsets, plot_vals, bar_w, color=colors, label=f'PW Acc — {spec_label}')
 
-        # Highlight best CARA rate
-        valid_cara = [(i, c) for i, c in enumerate(cara_rates) if c is not None]
-        if valid_cara:
-            best_cara_idx = max(valid_cara, key=lambda t: t[1])[0]
-            bars3[best_cara_idx].set_color('darkgreen')
+            valid = [(j, v) for j, v in enumerate(vals) if v is not None]
+            if valid:
+                best_j = max(valid, key=lambda t: t[1])[0]
+                bars[best_j].set_edgecolor('black')
+                bars[best_j].set_linewidth(1.5)
+
+            for bar, val, raw in zip(bars, plot_vals, vals):
+                if raw is not None:
+                    ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.02,
+                             f'{val:.2f}', ha='center', va='bottom', fontsize=7)
+                else:
+                    ax2.text(bar.get_x() + bar.get_width()/2, 0.05,
+                             'N/A', ha='center', va='bottom', fontsize=7, color='gray')
 
         ax2.set_xlabel('Configuration')
-        ax2.set_ylabel('CARA Rate')
-        ax2.set_title('Reward Model Evaluation: CARA Rate (% choosing risk-averse option)', fontsize=12)
+        ax2.set_ylabel('Pairwise Accuracy')
+        ax2.set_title('Reward Model Eval: Pairwise Accuracy (chosen > rejected)', fontsize=12)
         ax2.set_xticks(x)
         ax2.set_xticklabels(names, rotation=45, ha='right')
         ax2.set_ylim(0, 1.1)
         ax2.axhline(y=0.5, color='gray', linestyle=':', alpha=0.5, label='Random (0.5)')
-        ax2.legend(fontsize=8)
-
-        # Add value labels on CARA bars
-        for bar, val, raw in zip(bars3, cara_vals, cara_rates):
-            if raw is not None:
-                ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.02,
-                         f'{val:.3f}', ha='center', va='bottom', fontsize=8)
-            else:
-                ax2.text(bar.get_x() + bar.get_width()/2, 0.05,
-                         'N/A', ha='center', va='bottom', fontsize=8, color='gray')
+        ax2.legend(fontsize=8, loc='upper right')
 
     # Add data file footer
     train_file = os.path.basename(first_data.get('training_file', ''))

@@ -1,0 +1,74 @@
+{
+  "config": {
+    "name": "cot_lora_r64",
+    "learning_rate": 0.0001,
+    "reward_head_lr_multiplier": 1.0,
+    "lora_r": 64,
+    "lora_alpha": 128,
+    "lora_dropout": 0.05,
+    "lora_target_modules": [
+      "q_proj",
+      "k_proj",
+      "v_proj",
+      "o_proj",
+      "gate_proj",
+      "up_proj",
+      "down_proj"
+    ],
+    "model_name": "Qwen/Qwen3-8B",
+    "batch_size": 1,
+    "gradient_accumulation_steps": 64,
+    "num_epochs": 10,
+    "weight_decay": 0.05,
+    "max_length": 256,
+    "in_dist_val_split": 0.1,
+    "random_seed": 42,
+    "use_cot": true,
+    "cot_max_length": 768,
+    "use_lr_scheduler": true,
+    "warmup_ratio": 0.1,
+    "use_gradient_clipping": true,
+    "max_grad_norm": 1.0,
+    "use_reference_model": true,
+    "reference_kl_beta": 0.2,
+    "reward_head_init_std": 0.01,
+    "eval_batch_size": 4,
+    "early_stopping_patience": 2,
+    "ood_val_num_situations": 200,
+    "ood_val_rejected_type": "lin",
+    "run_reward_eval": true,
+    "reward_eval_num_situations": 50
+  },
+  "baseline": {
+    "out_dist_accuracy": 0.7920792079207921,
+    "in_dist_accuracy": 0.7181208053691275
+  },
+  "trained": {
+    "out_dist_accuracy": 0.9900990099009901,
+    "in_dist_accuracy": 1.0,
+    "best_out_dist_accuracy": 0.9900990099009901,
+    "error_type_breakdown": {
+      "too_risky": {
+        "accuracy": 0.9900990099009901,
+        "correct": 200,
+        "total": 202
+      }
+    }
+  },
+  "improvement": {
+    "out_dist_accuracy_gain": 0.19801980198019797,
+    "in_dist_accuracy_gain": 0.2818791946308725
+  },
+  "training_time_minutes": 78.54270348548889,
+  "data": {
+    "train_samples": 2629,
+    "in_dist_val_samples": 298,
+    "out_dist_val_samples": 202,
+    "training_file": "data/2026_03_22_low_stakes_training_set_1000_situations_with_CoTs.csv",
+    "out_dist_validation_file": "data/2026_03_22_reward_model_val_set_500_Rebels.csv",
+    "use_cot": true,
+    "training_label_type": "CARA CoT",
+    "in_dist_validation_label_type": "CARA CoT",
+    "out_dist_validation_label_type": "CARA CoT (out-of-distribution)"
+  }
+}
