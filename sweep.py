@@ -60,7 +60,7 @@ def set_seed(seed: int):
 class SweepConfig:
     """Configuration for a single training run."""
     name: str
-    learning_rate: float = 1e-4
+    learning_rate: float = 5e-4
     reward_head_lr_multiplier: float = 1.0  # Reward head LR = learning_rate * this
     lora_r: int = 32
     lora_alpha: int = 64
