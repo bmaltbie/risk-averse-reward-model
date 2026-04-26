@@ -76,7 +76,7 @@ pip install -r requirements.txt
 # 3. Summary
 # ------------------------------------------------------------
 submodule_sha="$(git -C "${SUBMODULE_PATH}" rev-parse --short HEAD 2>/dev/null || echo '?')"
-hf_token_status="not set (Qwen3 is public — fine)"
+hf_token_status="not set"
 if [ -n "${HF_TOKEN:-}" ]; then hf_token_status="set"; fi
 
 echo ""
