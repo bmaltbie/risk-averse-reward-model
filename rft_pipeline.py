@@ -17,17 +17,19 @@ backbone (fp16) + LoRA (FEATURE_EXTRACTION) + separately trained
 nn.Linear(hidden, 1) reward head (fp32), saved as reward_head.pt alongside
 the LoRA adapter.
 
-Per-run eval writes two JSONs per held-out dataset under each run dir:
-  - eval_<alias>.json     (in-process, reuses the in-memory backbone+head)
-  - eval_rm_<alias>.json  (subprocess: evaluate_reward_model.py from the
-                           submodule, which auto-loads reward_head.pt
-                           alongside the LoRA adapter at --model_path).
-The two paths are kept in parallel so their pairwise metrics can be
-cross-checked. Disable the script eval with --skip_script_eval.
+Per-run eval is delegated to the submodule's evaluate_reward_model.py.
+After train_one_run completes, run_single invokes that script via
+subprocess once per dataset, with --model_path set to the run's
+checkpoint dir (the script auto-loads reward_head.pt sitting next to
+the LoRA adapter). Per-dataset metrics land in run_dir/eval_rm_<alias>.json
+and are mirrored into status.json.
 
-Resumable: per-run `complete.json` and per-dataset `eval_<alias>.json`
-(plus `eval_rm_<alias>.json`) sentinels. `status.json` is rewritten after
-every run.
+Per-epoch validation inside train_one_run still uses an in-process
+score_pairs_in_process for fast best-epoch selection; that path does
+not write to the canonical eval_rm_<alias>.json.
+
+Resumable: per-run `complete.json` and per-dataset `eval_rm_<alias>.json`
+sentinels. `status.json` is rewritten after every run.
 """
 
 from __future__ import annotations
@@ -611,13 +613,13 @@ def train_one_run(
 
 
 # ============================================================
-# In-process eval (replaces evaluate_reward_model.py subprocess)
+# In-process eval — used ONLY for per-epoch validation in train_one_run
 #
-# Why in-process: our checkpoints save AutoModel+LoRA+reward_head.pt, but
-# evaluate_reward_model.py loads via AutoModelForSequenceClassification and
-# does not read reward_head.pt, so subprocess metrics would be garbage.
-# Reusing the training-time backbone/reward_head objects here guarantees
-# train/eval parity.
+# This is the fast path that reuses the in-memory backbone/reward_head
+# during training to drive best-epoch selection. Post-training eval has
+# moved to the evaluate_reward_model.py subprocess (see run_script_eval
+# below); these helpers stay because train_one_run still calls them at
+# every epoch boundary.
 # ============================================================
 
 def load_checkpoint_for_eval(base_model: str, ckpt_dir: Path, args: argparse.Namespace) -> Dict[str, Any]:
@@ -854,14 +856,12 @@ def score_pairs_in_process(
 
 
 # ============================================================
-# Augmenting subprocess eval via evaluate_reward_model.py
+# Post-training eval via evaluate_reward_model.py (subprocess)
 #
-# Each run also invokes the submodule's evaluate_reward_model.py per
-# dataset and writes eval_rm_<alias>.json next to eval_<alias>.json so
-# the two metric paths can be cross-checked. The script auto-detects
-# reward_head.pt inside --model_path (added in submodule commit b6eb08a).
-# Failures here are logged but do NOT fail the run — script eval is
-# supplementary, not the source of truth.
+# Canonical per-dataset metrics for each run come from the submodule's
+# evaluate_reward_model.py. The script auto-detects reward_head.pt
+# inside --model_path (submodule commit b6eb08a). Output lands in
+# run_dir/eval_rm_<alias>.json and is the resume sentinel.
 # ============================================================
 
 EVAL_SCRIPT_PATH = SUBMODULE_ROOT / "evaluate_reward_model.py"
@@ -882,7 +882,8 @@ def run_script_eval(
     num_pairs: Optional[int],
     tag: str,
 ) -> Optional[Dict[str, Any]]:
-    """Invoke evaluate_reward_model.py for one dataset; return its metrics dict."""
+    """Invoke evaluate_reward_model.py for one dataset; return its metrics dict
+    on success, None on failure. Caller decides whether to raise."""
     if out_json.exists():
         try:
             return load_json(out_json).get("metrics") or {}
@@ -1027,72 +1028,53 @@ def run_single(
 
         entry["training_wall_seconds"] = train_info.get("wall_seconds")
 
-        # --- Eval (skip per-dataset if output JSON exists) ---
-        pending_evals = [ds for ds in eval_datasets if not (run_dir / f"eval_{ds}.json").exists()]
-        if pending_evals and model_objs is None:
-            print(f"[run] {key} loading checkpoint for in-process eval ({len(pending_evals)} datasets pending)")
-            model_objs = load_checkpoint_for_eval(base_model, run_dir / "checkpoint", args)
+        # --- Eval ---
+        # Free the in-memory training model before the subprocess script eval
+        # so we don't hold the 8B backbone on GPU while the subprocess loads
+        # its own copy. Per-epoch validation inside train_one_run already
+        # produced everything it needed from this object.
+        if model_objs is not None:
+            for k in ("backbone", "reward_head", "tokenizer", "compute_rewards"):
+                model_objs.pop(k, None)
+            model_objs = None
+            gc.collect()
+            _try_empty_cache()
 
         for ds in eval_datasets:
-            out_json = run_dir / f"eval_{ds}.json"
             entry_eval = entry["eval"].setdefault(ds, {})
-            if out_json.exists():
-                print(f"[run] {key} {ds} already evaluated; loading existing.")
-                data = load_json(out_json)
-                metrics = data.get("metrics", {})
-                entry_eval.update({
-                    "status": "succeeded",
-                    "pairwise_accuracy": metrics.get("pairwise_accuracy"),
-                    "pairwise_accuracy_ties_half_credit": metrics.get("pairwise_accuracy_ties_half_credit"),
-                    "tie_rate": metrics.get("tie_rate"),
-                    "mean_score_margin": metrics.get("mean_score_margin"),
-                    "preference_log_loss": metrics.get("preference_log_loss"),
-                    "truncated_pair_rate": metrics.get("truncated_pair_rate"),
-                    "num_pairs": data.get("num_total"),
-                    "num_correct": data.get("num_correct"),
-                    "num_ties": data.get("num_ties", 0),
-                })
-            else:
-                tag = f"{key.phase}_lr_{lr_tag(key.lr)}_seed_{key.seed}_{ds}"
-                result = score_pairs_in_process(
-                    model_objs=model_objs,
-                    dataset_alias=ds,
-                    num_pairs=num_pairs_eval,
-                    output_json=out_json,
-                    args=args,
-                    tag=tag,
+            out_json = script_eval_output_path(run_dir, ds)
+            rel = DATASET_ALIAS_PATHS.get(ds)
+            if rel is None:
+                raise ValueError(f"Unknown dataset alias {ds!r}; not in DATASET_ALIAS_PATHS.")
+            tag = f"{key.phase}_lr_{lr_tag(key.lr)}_seed_{key.seed}_{ds}"
+            metrics = run_script_eval(
+                dataset_alias=ds,
+                csv_path=SUBMODULE_ROOT / rel,
+                ckpt_dir=run_dir / "checkpoint",
+                out_json=out_json,
+                base_model=base_model,
+                args=args,
+                num_pairs=num_pairs_eval,
+                tag=tag,
+            )
+            if metrics is None:
+                raise RuntimeError(
+                    f"evaluate_reward_model.py failed for {ds} ({tag}); see logs above."
                 )
-                entry_eval.update(result)
-
-            # Augment with subprocess script eval (cross-checks the in-process
-            # numbers above against evaluate_reward_model.py's loader path).
-            if not args.skip_script_eval:
-                rm_out = script_eval_output_path(run_dir, ds)
-                rel = DATASET_ALIAS_PATHS.get(ds)
-                if rel is None:
-                    print(f"[script_eval] no CSV path for dataset {ds!r}; skipping.")
-                else:
-                    rm_metrics = run_script_eval(
-                        dataset_alias=ds,
-                        csv_path=SUBMODULE_ROOT / rel,
-                        ckpt_dir=run_dir / "checkpoint",
-                        out_json=rm_out,
-                        base_model=base_model,
-                        args=args,
-                        num_pairs=num_pairs_eval,
-                        tag=f"{key.phase}_lr_{lr_tag(key.lr)}_seed_{key.seed}_{ds}",
-                    )
-                    if rm_metrics:
-                        entry_eval["script_eval"] = {
-                            "pairwise_accuracy": rm_metrics.get("pairwise_accuracy"),
-                            "pairwise_accuracy_ties_half_credit":
-                                rm_metrics.get("pairwise_accuracy_ties_half_credit"),
-                            "mean_score_margin": rm_metrics.get("mean_score_margin"),
-                            "tie_rate": rm_metrics.get("tie_rate"),
-                            "preference_log_loss": rm_metrics.get("preference_log_loss"),
-                            "truncated_pair_rate": rm_metrics.get("truncated_pair_rate"),
-                            "output_json": str(rm_out),
-                        }
+            data = load_json(out_json)
+            entry_eval.update({
+                "status": "succeeded",
+                "pairwise_accuracy": metrics.get("pairwise_accuracy"),
+                "pairwise_accuracy_ties_half_credit": metrics.get("pairwise_accuracy_ties_half_credit"),
+                "tie_rate": metrics.get("tie_rate"),
+                "mean_score_margin": metrics.get("mean_score_margin"),
+                "preference_log_loss": metrics.get("preference_log_loss"),
+                "truncated_pair_rate": metrics.get("truncated_pair_rate"),
+                "num_pairs": data.get("num_total"),
+                "num_correct": data.get("num_correct"),
+                "num_ties": data.get("num_ties", 0),
+                "output_json": str(out_json),
+            })
             write_status(status, status_path)
 
         entry["status"] = "succeeded"
@@ -1200,15 +1182,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--best_lr", type=float, default=None)
     p.add_argument("--skip_heldout", action="store_true")
     p.add_argument("--heldout_datasets", type=parse_str_csv, default=DEFAULT_HELDOUT_DATASETS)
-    p.add_argument(
-        "--skip_script_eval",
-        action="store_true",
-        help=(
-            "Disable the per-dataset evaluate_reward_model.py subprocess eval "
-            "(otherwise each run writes eval_rm_<alias>.json next to the "
-            "in-process eval_<alias>.json for cross-checking)."
-        ),
-    )
     p.add_argument("--torch_dtype", type=str, default=DEFAULT_TORCH_DTYPE)
     p.add_argument("--trust_remote_code", action="store_true")
     p.add_argument("--grad_ckpt", dest="grad_ckpt", action="store_true", default=DEFAULT_GRAD_CKPT)
