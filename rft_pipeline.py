@@ -15,12 +15,19 @@ Parameterized by --base_model so the same script runs Qwen3-1.7B / 8B / 14B
 (Ben.pdf items 13, 14). Architecture matches sweep.py / colab: AutoModel
 backbone (fp16) + LoRA (FEATURE_EXTRACTION) + separately trained
 nn.Linear(hidden, 1) reward head (fp32), saved as reward_head.pt alongside
-the LoRA adapter. WARNING: the submodule's evaluate_reward_model.py loads
-via AutoModelForSequenceClassification and does NOT read reward_head.pt —
-its metrics reflect a random score head, not the trained one.
+the LoRA adapter.
+
+Per-run eval writes two JSONs per held-out dataset under each run dir:
+  - eval_<alias>.json     (in-process, reuses the in-memory backbone+head)
+  - eval_rm_<alias>.json  (subprocess: evaluate_reward_model.py from the
+                           submodule, which auto-loads reward_head.pt
+                           alongside the LoRA adapter at --model_path).
+The two paths are kept in parallel so their pairwise metrics can be
+cross-checked. Disable the script eval with --skip_script_eval.
 
 Resumable: per-run `complete.json` and per-dataset `eval_<alias>.json`
-sentinels. `status.json` is rewritten after every run.
+(plus `eval_rm_<alias>.json`) sentinels. `status.json` is rewritten after
+every run.
 """
 
 from __future__ import annotations
@@ -33,6 +40,7 @@ import os
 import random
 import re
 import shutil
+import subprocess
 import sys
 import time
 import traceback
@@ -846,6 +854,83 @@ def score_pairs_in_process(
 
 
 # ============================================================
+# Augmenting subprocess eval via evaluate_reward_model.py
+#
+# Each run also invokes the submodule's evaluate_reward_model.py per
+# dataset and writes eval_rm_<alias>.json next to eval_<alias>.json so
+# the two metric paths can be cross-checked. The script auto-detects
+# reward_head.pt inside --model_path (added in submodule commit b6eb08a).
+# Failures here are logged but do NOT fail the run — script eval is
+# supplementary, not the source of truth.
+# ============================================================
+
+EVAL_SCRIPT_PATH = SUBMODULE_ROOT / "evaluate_reward_model.py"
+
+
+def script_eval_output_path(run_dir: Path, dataset_alias: str) -> Path:
+    return run_dir / f"eval_rm_{dataset_alias}.json"
+
+
+def run_script_eval(
+    *,
+    dataset_alias: str,
+    csv_path: Path,
+    ckpt_dir: Path,
+    out_json: Path,
+    base_model: str,
+    args: argparse.Namespace,
+    num_pairs: Optional[int],
+    tag: str,
+) -> Optional[Dict[str, Any]]:
+    """Invoke evaluate_reward_model.py for one dataset; return its metrics dict."""
+    if out_json.exists():
+        try:
+            return load_json(out_json).get("metrics") or {}
+        except Exception:
+            print(f"[script_eval:{tag}] existing {out_json.name} unreadable; re-running")
+
+    if not EVAL_SCRIPT_PATH.exists():
+        print(f"[script_eval:{tag}] {EVAL_SCRIPT_PATH} missing; skipping (submodule not initialized?).")
+        return None
+
+    cmd = [
+        sys.executable, "-u", str(EVAL_SCRIPT_PATH),
+        "--base_model", base_model,
+        "--model_path", str(ckpt_dir),
+        "--custom_csv", str(csv_path),
+        "--output", str(out_json),
+        "--max_length", str(args.eval_max_length),
+        "--batch_size", str(args.eval_batch_size),
+        "--torch_dtype", args.torch_dtype,
+        "--device_map", "auto",
+        # Pipeline trains and evaluates with NO system prompt; pass an empty
+        # string explicitly so the script does not fall back to its dataset
+        # default (see risk_averse_prompts.resolve_system_prompt).
+        "--system_prompt", "",
+    ]
+    if num_pairs:
+        cmd.extend(["--num_pairs", str(num_pairs)])
+    if args.trust_remote_code:
+        cmd.append("--trust_remote_code")
+
+    print(f"[script_eval:{tag}] {' '.join(cmd)}", flush=True)
+    try:
+        subprocess.run(cmd, cwd=str(SUBMODULE_ROOT), check=True)
+    except subprocess.CalledProcessError as e:
+        print(f"[script_eval:{tag}] subprocess failed (exit={e.returncode}); pipeline continues.")
+        return None
+    except Exception as e:
+        print(f"[script_eval:{tag}] error invoking script: {type(e).__name__}: {e}")
+        return None
+
+    try:
+        return load_json(out_json).get("metrics") or {}
+    except Exception as e:
+        print(f"[script_eval:{tag}] could not parse output JSON {out_json}: {e}")
+        return None
+
+
+# ============================================================
 # Status tracking
 # ============================================================
 
@@ -978,6 +1063,36 @@ def run_single(
                     tag=tag,
                 )
                 entry_eval.update(result)
+
+            # Augment with subprocess script eval (cross-checks the in-process
+            # numbers above against evaluate_reward_model.py's loader path).
+            if not args.skip_script_eval:
+                rm_out = script_eval_output_path(run_dir, ds)
+                rel = DATASET_ALIAS_PATHS.get(ds)
+                if rel is None:
+                    print(f"[script_eval] no CSV path for dataset {ds!r}; skipping.")
+                else:
+                    rm_metrics = run_script_eval(
+                        dataset_alias=ds,
+                        csv_path=SUBMODULE_ROOT / rel,
+                        ckpt_dir=run_dir / "checkpoint",
+                        out_json=rm_out,
+                        base_model=base_model,
+                        args=args,
+                        num_pairs=num_pairs_eval,
+                        tag=f"{key.phase}_lr_{lr_tag(key.lr)}_seed_{key.seed}_{ds}",
+                    )
+                    if rm_metrics:
+                        entry_eval["script_eval"] = {
+                            "pairwise_accuracy": rm_metrics.get("pairwise_accuracy"),
+                            "pairwise_accuracy_ties_half_credit":
+                                rm_metrics.get("pairwise_accuracy_ties_half_credit"),
+                            "mean_score_margin": rm_metrics.get("mean_score_margin"),
+                            "tie_rate": rm_metrics.get("tie_rate"),
+                            "preference_log_loss": rm_metrics.get("preference_log_loss"),
+                            "truncated_pair_rate": rm_metrics.get("truncated_pair_rate"),
+                            "output_json": str(rm_out),
+                        }
             write_status(status, status_path)
 
         entry["status"] = "succeeded"
@@ -1085,6 +1200,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--best_lr", type=float, default=None)
     p.add_argument("--skip_heldout", action="store_true")
     p.add_argument("--heldout_datasets", type=parse_str_csv, default=DEFAULT_HELDOUT_DATASETS)
+    p.add_argument(
+        "--skip_script_eval",
+        action="store_true",
+        help=(
+            "Disable the per-dataset evaluate_reward_model.py subprocess eval "
+            "(otherwise each run writes eval_rm_<alias>.json next to the "
+            "in-process eval_<alias>.json for cross-checking)."
+        ),
+    )
     p.add_argument("--torch_dtype", type=str, default=DEFAULT_TORCH_DTYPE)
     p.add_argument("--trust_remote_code", action="store_true")
     p.add_argument("--grad_ckpt", dest="grad_ckpt", action="store_true", default=DEFAULT_GRAD_CKPT)
