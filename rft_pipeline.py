@@ -119,6 +119,15 @@ DEFAULT_HELDOUT_DATASETS = [                # override: --heldout_datasets
     "reward_model_steals_test",
 ]
 
+# --- Reward-Bench 2 (separate phase, not part of heldout) ---
+DEFAULT_RB2_BATCH_SIZE = 16                 # override: --rb2_batch_size
+DEFAULT_RB2_MAX_LENGTH = 4096               # override: --rb2_max_length
+# All 6 subsets. The standalone evaluate_reward_bench_2.py handles the
+# standard 5 (Factuality/Precise IF/Math/Safety/Focus) with all-pairs-win
+# and Ties with the canonical RB2 weighted metric (process_single_model).
+# Override with --rb2_subsets or --rb2_skip_ties.
+DEFAULT_RB2_SUBSETS = "Factuality,Precise IF,Math,Safety,Focus,Ties"
+
 # --- Dataset alias → submodule CSV path (not flag-overridable) ---
 # Mirrors DATASET_ALIASES in eval/risk-averse-ai-eval/evaluate_reward_model.py:55-66
 # so in-process eval reads the same files the subprocess would have resolved.
@@ -219,6 +228,52 @@ def parse_torch_dtype_name(name: str):
     if name == "auto":
         return _torch.bfloat16 if _torch.cuda.is_available() else _torch.float32
     raise ValueError(f"Unknown --torch_dtype {name!r}")
+
+
+def unwrap_text_backbone(backbone):
+    """Strip the vision tower from multimodal models so we only train on text.
+
+    Multimodal AutoModel loads (e.g. google/gemma-3-12b-it, llava-style models,
+    Pixtral, Llama-3.2-Vision) return a wrapper class with a `.language_model`
+    or `.text_model` submodule alongside a vision tower. For risk-averse-reward
+    training we only need the text encoder:
+      - The dataset is pure text (prompt + CoT).
+      - LoRA targets `q_proj`/`k_proj`/etc. exist inside the language model.
+      - The vision tower wastes memory + the multimodal config doesn't expose
+        a flat `hidden_size` (raises AttributeError when the reward head reads it).
+
+    Returns the language sub-module if the loaded backbone is multimodal,
+    otherwise the input unchanged. Safe to call on any HF backbone.
+
+    On unwrap, explicitly del's the parent + runs gc.collect() +
+    torch.cuda.empty_cache() so the vision-tower GPU memory is reclaimed
+    deterministically (Python GC alone leaves it in the CUDA caching allocator,
+    which can cause downstream OOMs during training — observed on Gemma 3).
+    """
+    for attr in ("language_model", "text_model"):
+        sub = getattr(backbone, attr, None)
+        if sub is not None and hasattr(sub.config, "hidden_size"):
+            print(f"[unwrap_text_backbone] multimodal backbone {type(backbone).__name__} → "
+                  f"using .{attr} ({type(sub).__name__}, hidden_size={sub.config.hidden_size})",
+                  flush=True)
+            text_model = sub
+            del backbone
+            import gc as _gc
+            _gc.collect()
+            try:
+                import torch as _torch
+                if _torch.cuda.is_available():
+                    before_free, before_total = _torch.cuda.mem_get_info()
+                    _torch.cuda.empty_cache()
+                    after_free, after_total = _torch.cuda.mem_get_info()
+                    reclaimed_gb = (after_free - before_free) / (1024 ** 3)
+                    print(f"[unwrap_text_backbone] reclaimed {reclaimed_gb:.2f} GiB; "
+                          f"GPU free now {after_free / (1024 ** 3):.2f} / "
+                          f"{after_total / (1024 ** 3):.2f} GiB", flush=True)
+            except Exception as e:
+                print(f"[unwrap_text_backbone] cuda cleanup skipped: {e}", flush=True)
+            return text_model
+    return backbone
 
 
 def make_compute_rewards(backbone, reward_head):
@@ -401,6 +456,7 @@ def train_one_run(
         device_map="auto" if torch.cuda.is_available() else None,
         token=_hf_token(),
     )
+    backbone = unwrap_text_backbone(backbone)
     if getattr(backbone.config, "pad_token_id", None) is None:
         backbone.config.pad_token_id = tokenizer.pad_token_id
 
@@ -642,6 +698,7 @@ def load_checkpoint_for_eval(base_model: str, ckpt_dir: Path, args: argparse.Nam
         device_map="auto" if torch.cuda.is_available() else None,
         token=_hf_token(),
     )
+    backbone_base = unwrap_text_backbone(backbone_base)
     if getattr(backbone_base.config, "pad_token_id", None) is None:
         backbone_base.config.pad_token_id = tokenizer.pad_token_id
     backbone = ml["PeftModel"].from_pretrained(backbone_base, str(ckpt_dir))
@@ -865,6 +922,8 @@ def score_pairs_in_process(
 # ============================================================
 
 EVAL_SCRIPT_PATH = SUBMODULE_ROOT / "evaluate_reward_model.py"
+RB2_SCRIPT_PATH = PROJECT_ROOT / "evaluate_reward_bench_2.py"
+RB2_OUTPUT_BASENAME = "eval_reward_bench_2.json"
 
 
 def script_eval_output_path(run_dir: Path, dataset_alias: str) -> Path:
@@ -928,6 +987,97 @@ def run_script_eval(
         return load_json(out_json).get("metrics") or {}
     except Exception as e:
         print(f"[script_eval:{tag}] could not parse output JSON {out_json}: {e}")
+        return None
+
+
+# ============================================================
+# Post-training Reward-Bench 2 eval (subprocess)
+#
+# Separate from the heldout eval above. Uses the standalone
+# evaluate_reward_bench_2.py at the parent-repo root, which loads RB2 from
+# HuggingFace (allenai/reward-bench-2) and emits its own JSON. Result is
+# stored on the per-seed status entry under entry["reward_bench_2"], not in
+# entry["eval"], to keep the heldout-aggregate code paths unaffected.
+# ============================================================
+
+def rb2_output_path(run_dir: Path) -> Path:
+    return run_dir / RB2_OUTPUT_BASENAME
+
+
+def run_reward_bench_2_eval(
+    *,
+    ckpt_dir: Path,
+    out_json: Path,
+    base_model: str,
+    args: argparse.Namespace,
+    tag: str,
+) -> Optional[Dict[str, Any]]:
+    """Invoke evaluate_reward_bench_2.py for one checkpoint. Return its parsed
+    payload on success, None on failure.
+
+    Resume-safe: if `out_json` already exists AND already has both
+    `metrics_per_subset` and (when Ties is requested) `ties_metrics`, we
+    reuse it. Older v1 outputs missing `ties_metrics` get re-computed so
+    the new canonical Ties scoring fills in.
+    """
+    want_ties = ("ties" in args.rb2_subsets.lower()) and not getattr(args, "rb2_skip_ties", False)
+    if out_json.exists():
+        try:
+            existing = load_json(out_json)
+        except Exception:
+            print(f"[rb2:{tag}] existing {out_json.name} unreadable; re-running")
+            existing = None
+        if existing is not None:
+            has_standard = bool(existing.get("metrics_per_subset"))
+            has_ties = bool(existing.get("ties_metrics"))
+            if has_standard and (not want_ties or has_ties):
+                return existing
+            missing = []
+            if not has_standard:
+                missing.append("metrics_per_subset")
+            if want_ties and not has_ties:
+                missing.append("ties_metrics")
+            print(f"[rb2:{tag}] existing {out_json.name} missing {missing}; re-running")
+
+    if not RB2_SCRIPT_PATH.exists():
+        print(f"[rb2:{tag}] {RB2_SCRIPT_PATH} missing; skipping.")
+        return None
+
+    cmd = [
+        sys.executable, "-u", str(RB2_SCRIPT_PATH),
+        "--base_model", base_model,
+        "--model_path", str(ckpt_dir),
+        "--output", str(out_json),
+        "--max_length", str(args.rb2_max_length),
+        "--batch_size", str(args.rb2_batch_size),
+        "--torch_dtype", args.torch_dtype,
+        "--device_map", "auto",
+        "--subsets", args.rb2_subsets,
+        "--force",  # we already gated re-run above; this avoids the script's own skip check
+    ]
+    if args.rb2_num_examples:
+        cmd.extend(["--num_examples", str(args.rb2_num_examples)])
+    if getattr(args, "rb2_skip_ties", False):
+        cmd.append("--skip_ties")
+    if args.rb2_cache_dir:
+        cmd.extend(["--cache_dir", str(args.rb2_cache_dir)])
+    if args.trust_remote_code:
+        cmd.append("--trust_remote_code")
+
+    print(f"[rb2:{tag}] {' '.join(cmd)}", flush=True)
+    try:
+        subprocess.run(cmd, cwd=str(PROJECT_ROOT), check=True)
+    except subprocess.CalledProcessError as e:
+        print(f"[rb2:{tag}] subprocess failed (exit={e.returncode}); pipeline continues.")
+        return None
+    except Exception as e:
+        print(f"[rb2:{tag}] error invoking script: {type(e).__name__}: {e}")
+        return None
+
+    try:
+        return load_json(out_json)
+    except Exception as e:
+        print(f"[rb2:{tag}] could not parse output JSON {out_json}: {e}")
         return None
 
 
@@ -1182,6 +1332,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--best_lr", type=float, default=None)
     p.add_argument("--skip_heldout", action="store_true")
     p.add_argument("--heldout_datasets", type=parse_str_csv, default=DEFAULT_HELDOUT_DATASETS)
+    p.add_argument("--skip_reward_bench_2", action="store_true",
+                   help="Skip the Reward-Bench 2 phase (default: run after heldout for each seed).")
+    p.add_argument("--rb2_batch_size", type=int, default=DEFAULT_RB2_BATCH_SIZE)
+    p.add_argument("--rb2_max_length", type=int, default=DEFAULT_RB2_MAX_LENGTH)
+    p.add_argument("--rb2_subsets", type=str, default=DEFAULT_RB2_SUBSETS,
+                   help="Comma-separated RB2 subset names. Default = all 6.")
+    p.add_argument("--rb2_skip_ties", action="store_true",
+                   help="Skip the Ties subset entirely (don't load, don't score).")
+    p.add_argument("--rb2_num_examples", type=int, default=None,
+                   help="Cap RB2 example count (debug). Default: all in --rb2_subsets.")
+    p.add_argument("--rb2_cache_dir", type=str, default=None,
+                   help="HF datasets cache dir for RB2 (default: HF default).")
     p.add_argument("--torch_dtype", type=str, default=DEFAULT_TORCH_DTYPE)
     p.add_argument("--trust_remote_code", action="store_true")
     p.add_argument("--grad_ckpt", dest="grad_ckpt", action="store_true", default=DEFAULT_GRAD_CKPT)
@@ -1215,6 +1377,8 @@ def write_final_summary(args: argparse.Namespace, status: Dict[str, Any]) -> Non
         "validation": None,
         "heldout_per_seed": {},
         "heldout_aggregate": {},
+        "reward_bench_2_per_seed": {},
+        "reward_bench_2_aggregate": {},
     }
 
     if best_lr is not None:
@@ -1272,6 +1436,100 @@ def write_final_summary(args: argparse.Namespace, status: Dict[str, Any]) -> Non
             agg[ds] = ds_summary
         summary["heldout_aggregate"] = agg
 
+        # --- Reward-Bench 2 sections (parallel to heldout_*; not nested) ---
+        rb2_per_seed: Dict[str, Dict[str, Any]] = {}
+        for seed in args.seeds_heldout:
+            try:
+                entry = find_run(status, RunKey("heldout", best_lr, seed))
+            except KeyError:
+                continue
+            rb2 = entry.get("reward_bench_2")
+            if not rb2 or rb2.get("status") != "succeeded":
+                continue
+            rb2_per_seed[str(seed)] = {
+                "metrics_overall": rb2.get("metrics_overall", {}),
+                "metrics_per_subset": rb2.get("metrics_per_subset", {}),
+                "ties_metrics": rb2.get("ties_metrics") or {},
+                "combined_score": rb2.get("combined_score"),
+                "output_json": rb2.get("output_json"),
+            }
+        summary["reward_bench_2_per_seed"] = rb2_per_seed
+
+        # Aggregate across seeds: mean ± sd of {all_pairs_win, pairwise, mean_margin}
+        # for the overall standard subsets, plus the canonical Ties metrics + combined_score.
+        RB2_METRICS = ("all_pairs_win_accuracy", "pairwise_accuracy", "mean_margin")
+        TIES_METRICS = ("overall_score", "ref_accuracy", "tied_accuracy",
+                        "correctness_preferred", "correctness_preferred_hard",
+                        "correctness_margin_score")
+
+        def _agg_metrics(values_by_metric: Dict[str, List[float]]) -> Dict[str, Dict[str, Optional[float]]]:
+            out: Dict[str, Dict[str, Optional[float]]] = {}
+            for m, vals in values_by_metric.items():
+                if not vals:
+                    out[m] = {"mean": None, "sd": None}
+                elif len(vals) == 1:
+                    out[m] = {"mean": vals[0], "sd": None}
+                else:
+                    out[m] = {"mean": float(np.mean(vals)), "sd": float(np.std(vals, ddof=1))}
+            return out
+
+        if rb2_per_seed:
+            overall_vals: Dict[str, List[float]] = {m: [] for m in RB2_METRICS}
+            subset_vals: Dict[str, Dict[str, List[float]]] = {}
+            example_counts: Dict[str, int] = {}
+            ties_vals: Dict[str, List[float]] = {m: [] for m in TIES_METRICS}
+            combined_vals: List[float] = []
+            ties_n_ref: List[int] = []
+            ties_n_tied: List[int] = []
+            for seed_key, payload in rb2_per_seed.items():
+                mo = payload.get("metrics_overall", {}) or {}
+                for m in RB2_METRICS:
+                    v = mo.get(m)
+                    if v is not None:
+                        overall_vals[m].append(float(v))
+                for sub, sm in (payload.get("metrics_per_subset") or {}).items():
+                    sv = subset_vals.setdefault(sub, {m: [] for m in RB2_METRICS})
+                    for m in RB2_METRICS:
+                        v = sm.get(m)
+                        if v is not None:
+                            sv[m].append(float(v))
+                    if "n_examples" in sm and sm["n_examples"] is not None:
+                        example_counts[sub] = int(sm["n_examples"])
+                tm = payload.get("ties_metrics") or {}
+                if tm:
+                    for m in TIES_METRICS:
+                        v = tm.get(m)
+                        if v is not None:
+                            ties_vals[m].append(float(v))
+                    if tm.get("n_ref_rows") is not None:
+                        ties_n_ref.append(int(tm["n_ref_rows"]))
+                    if tm.get("n_tied_rows") is not None:
+                        ties_n_tied.append(int(tm["n_tied_rows"]))
+                cs = payload.get("combined_score")
+                if cs is not None:
+                    combined_vals.append(float(cs))
+
+            rb2_agg: Dict[str, Any] = {
+                "n_seeds": len(rb2_per_seed),
+                "overall": _agg_metrics(overall_vals),
+                "per_subset": {},
+            }
+            for sub, vals in subset_vals.items():
+                sub_entry = _agg_metrics(vals)
+                if sub in example_counts:
+                    sub_entry["n_examples"] = example_counts[sub]
+                rb2_agg["per_subset"][sub] = sub_entry
+            if any(ties_vals.values()):
+                ties_agg = _agg_metrics(ties_vals)
+                if ties_n_ref:
+                    ties_agg["n_ref_rows"] = ties_n_ref[0]
+                if ties_n_tied:
+                    ties_agg["n_tied_rows"] = ties_n_tied[0]
+                rb2_agg["ties"] = ties_agg
+            if combined_vals:
+                rb2_agg["combined_score"] = _agg_metrics({"combined_score": combined_vals})["combined_score"]
+            summary["reward_bench_2_aggregate"] = rb2_agg
+
     atomic_write_json(args.output_dir / "final_summary.json", summary)
 
 
@@ -1305,17 +1563,28 @@ def main() -> int:
         try:
             prior = load_json(status_path)
             prior_by_key = {(r["phase"], round(r["lr"], 12), r["seed"]): r for r in prior.get("runs", [])}
+            current_keys = {(r["phase"], round(r["lr"], 12), r["seed"]) for r in status["runs"]}
             for r in status["runs"]:
                 k = (r["phase"], round(r["lr"], 12), r["seed"])
                 if k in prior_by_key:
+                    pr = prior_by_key[k]
                     r.update({
-                        "status": prior_by_key[k].get("status", "pending"),
-                        "training_wall_seconds": prior_by_key[k].get("training_wall_seconds"),
-                        "eval": prior_by_key[k].get("eval", {}),
-                        "error_type": prior_by_key[k].get("error_type"),
-                        "error_message": prior_by_key[k].get("error_message"),
-                        "traceback": prior_by_key[k].get("traceback"),
+                        "status": pr.get("status", "pending"),
+                        "training_wall_seconds": pr.get("training_wall_seconds"),
+                        "eval": pr.get("eval", {}),
+                        "error_type": pr.get("error_type"),
+                        "error_message": pr.get("error_message"),
+                        "traceback": pr.get("traceback"),
                     })
+                    # Preserve any prior phase-3 (RB2) result so re-runs aren't lossy.
+                    if "reward_bench_2" in pr:
+                        r["reward_bench_2"] = pr["reward_bench_2"]
+            # Carry over any prior runs the new plan didn't include — needed when
+            # both --skip_validation and --skip_heldout are set (e.g. RB2 backfill)
+            # so phase 3 can find the existing heldout entries via find_run().
+            for k, pr in prior_by_key.items():
+                if k not in current_keys:
+                    status["runs"].append(dict(pr))
             status["best_lr"] = prior.get("best_lr", status["best_lr"])
         except Exception as e:
             print(f"[main] WARNING: could not read existing status.json ({e}); starting fresh.")
@@ -1389,6 +1658,46 @@ def main() -> int:
                 status=status,
                 status_path=status_path,
             )
+
+    # --- Phase 3: Reward-Bench 2 (separate from heldout) ---
+    if not args.skip_reward_bench_2:
+        print(f"[main] Phase 3: Reward-Bench 2 eval ({len(args.seeds_heldout)} seeds)")
+        for seed in args.seeds_heldout:
+            try:
+                entry = find_run(status, RunKey("heldout", best_lr, seed))
+            except KeyError:
+                print(f"[rb2] no heldout entry for seed={seed}; skipping.")
+                continue
+            if entry["status"] != "succeeded":
+                print(f"[rb2] heldout seed={seed} status={entry['status']!r}; skipping.")
+                continue
+            run_dir = args.output_dir / entry["run_dir"]
+            ckpt_dir = run_dir / "checkpoint"
+            if not ckpt_dir.exists():
+                print(f"[rb2] checkpoint missing at {ckpt_dir}; skipping seed={seed}.")
+                continue
+            out_json = rb2_output_path(run_dir)
+            tag = f"seed_{seed}"
+            payload = run_reward_bench_2_eval(
+                ckpt_dir=ckpt_dir,
+                out_json=out_json,
+                base_model=args.base_model,
+                args=args,
+                tag=tag,
+            )
+            if payload is None:
+                entry["reward_bench_2"] = {"status": "failed", "output_json": str(out_json)}
+            else:
+                entry["reward_bench_2"] = {
+                    "status": "succeeded",
+                    "output_json": str(out_json),
+                    "metrics_overall": payload.get("metrics_overall", {}),
+                    "metrics_per_subset": payload.get("metrics_per_subset", {}),
+                    "ties_metrics": payload.get("ties_metrics") or {},
+                    "combined_score": payload.get("combined_score"),
+                    "config": payload.get("config", {}),
+                }
+            write_status(status, status_path)
 
     write_final_summary(args, status)
     print(f"[main] done. Output dir: {args.output_dir}")
