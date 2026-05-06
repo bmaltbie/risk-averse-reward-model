@@ -1,0 +1,38 @@
+{
+  "base_model": "Qwen/Qwen3-8B",
+  "middle_lr": 0.0005,
+  "output_dir": "/__modal/volumes/vo-dJb2XfIUQDx2Yey8FWnass/epoch_ablation_v2_e7",
+  "train_csv": "/app/eval/risk-averse-ai-eval/data/2026_03_22_low_stakes_training_set_1000_situations_with_CoTs.csv",
+  "val_num_pairs": 200,
+  "heldout_num_pairs": 1000,
+  "epochs": 7,
+  "batch_size": 2,
+  "grad_accum_steps": 32,
+  "max_length": 1024,
+  "weight_decay": 0.05,
+  "warmup_ratio": 0.1,
+  "max_grad_norm": 1.0,
+  "eval_batch_size": 16,
+  "eval_max_length": 4096,
+  "seeds_validation": [
+    1
+  ],
+  "seeds_heldout": [
+    1,
+    2,
+    3
+  ],
+  "skip_validation": false,
+  "single_lr": true,
+  "best_lr": null,
+  "skip_heldout": true,
+  "heldout_datasets": [
+    "reward_model_high_stakes_test",
+    "reward_model_astronomical_stakes_deployment",
+    "reward_model_steals_test"
+  ],
+  "torch_dtype": "float16",
+  "trust_remote_code": false,
+  "grad_ckpt": true,
+  "dry_run": false
+}

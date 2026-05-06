@@ -1,0 +1,56 @@
+{
+  "base_model": "meta-llama/Llama-3.1-8B-Instruct",
+  "output_dir": "/__modal/volumes/vo-dJb2XfIUQDx2Yey8FWnass/llama-3p1-8b-instruct/epoch_ablation_e5",
+  "started_at": "2026-05-02T02:34:08+00:00",
+  "updated_at": "2026-05-02T03:09:24+00:00",
+  "lr_ladder": [
+    1e-06,
+    5e-06,
+    1e-05,
+    5e-05,
+    0.0001,
+    0.0005,
+    0.001
+  ],
+  "middle_lr": 0.0005,
+  "candidate_lrs": [
+    0.0005
+  ],
+  "best_lr": 0.0005,
+  "counts": {
+    "planned": 1,
+    "succeeded": 1,
+    "failed": 0,
+    "pending": 0,
+    "running": 0
+  },
+  "runs": [
+    {
+      "phase": "validation",
+      "lr": 0.0005,
+      "seed": 1,
+      "run_dir": "validation/lr_5e-04_seed_1",
+      "status": "succeeded",
+      "training_wall_seconds": 2048.7,
+      "eval": {
+        "reward_model_validation": {
+          "status": "succeeded",
+          "pairwise_accuracy": 1.0,
+          "pairwise_accuracy_ties_half_credit": 1.0,
+          "tie_rate": 0.0,
+          "mean_score_margin": 15.29374607950449,
+          "preference_log_loss": 0.001867068336802315,
+          "truncated_pair_rate": 0.0,
+          "num_pairs": 200,
+          "num_correct": 200,
+          "num_ties": 0,
+          "output_json": "/__modal/volumes/vo-dJb2XfIUQDx2Yey8FWnass/llama-3p1-8b-instruct/epoch_ablation_e5/validation/lr_5e-04_seed_1/eval_rm_reward_model_validation.json"
+        }
+      },
+      "error_type": null,
+      "error_message": null,
+      "traceback": null,
+      "wall_seconds": 2116.4
+    }
+  ]
+}

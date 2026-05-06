@@ -1,0 +1,194 @@
+{
+  "base_model": "Qwen/Qwen3-1.7B",
+  "output_dir": "/__modal/volumes/vo-dJb2XfIUQDx2Yey8FWnass/baseline_qwen3-1p7b",
+  "started_at": "2026-05-06T17:47:36+00:00",
+  "updated_at": "2026-05-06T17:53:10+00:00",
+  "lr_ladder": [
+    1e-06,
+    5e-06,
+    1e-05,
+    5e-05,
+    0.0001,
+    0.0005,
+    0.001
+  ],
+  "middle_lr": 0.0005,
+  "candidate_lrs": [
+    0.0005
+  ],
+  "best_lr": 0.0005,
+  "counts": {
+    "planned": 2,
+    "succeeded": 2,
+    "failed": 0,
+    "pending": 0,
+    "running": 0
+  },
+  "runs": [
+    {
+      "phase": "validation",
+      "lr": 0.0005,
+      "seed": 1,
+      "run_dir": "validation/lr_5e-04_seed_1",
+      "status": "succeeded",
+      "training_wall_seconds": 13.7,
+      "eval": {
+        "reward_model_validation": {
+          "status": "succeeded",
+          "pairwise_accuracy": 0.87,
+          "pairwise_accuracy_ties_half_credit": 0.87,
+          "tie_rate": 0.0,
+          "mean_score_margin": 0.17939456999301912,
+          "preference_log_loss": 0.6111958188165303,
+          "truncated_pair_rate": 0.0,
+          "num_pairs": 200,
+          "num_correct": 174,
+          "num_ties": 0,
+          "output_json": "/__modal/volumes/vo-dJb2XfIUQDx2Yey8FWnass/baseline_qwen3-1p7b/validation/lr_5e-04_seed_1/eval_rm_reward_model_validation.json"
+        }
+      },
+      "error_type": null,
+      "error_message": null,
+      "traceback": null,
+      "wall_seconds": 47.2
+    },
+    {
+      "phase": "heldout",
+      "lr": 0.0005,
+      "seed": 1,
+      "run_dir": "heldout/lr_5e-04_seed_1",
+      "status": "succeeded",
+      "training_wall_seconds": 9.5,
+      "eval": {
+        "reward_model_high_stakes_test": {
+          "status": "succeeded",
+          "pairwise_accuracy": 0.3873994638069705,
+          "pairwise_accuracy_ties_half_credit": 0.3873994638069705,
+          "tie_rate": 0.0,
+          "mean_score_margin": -0.049127510022222196,
+          "preference_log_loss": 0.7228561589669162,
+          "truncated_pair_rate": 0.0,
+          "num_pairs": 746,
+          "num_correct": 289,
+          "num_ties": 0,
+          "output_json": "/__modal/volumes/vo-dJb2XfIUQDx2Yey8FWnass/baseline_qwen3-1p7b/heldout/lr_5e-04_seed_1/eval_rm_reward_model_high_stakes_test.json"
+        },
+        "reward_model_astronomical_stakes_deployment": {
+          "status": "succeeded",
+          "pairwise_accuracy": 0.57991513437058,
+          "pairwise_accuracy_ties_half_credit": 0.57991513437058,
+          "tie_rate": 0.0,
+          "mean_score_margin": 0.03344070026189974,
+          "preference_log_loss": 0.6807907783719677,
+          "truncated_pair_rate": 0.0,
+          "num_pairs": 707,
+          "num_correct": 410,
+          "num_ties": 0,
+          "output_json": "/__modal/volumes/vo-dJb2XfIUQDx2Yey8FWnass/baseline_qwen3-1p7b/heldout/lr_5e-04_seed_1/eval_rm_reward_model_astronomical_stakes_deployment.json"
+        },
+        "reward_model_steals_test": {
+          "status": "succeeded",
+          "pairwise_accuracy": 0.540948275862069,
+          "pairwise_accuracy_ties_half_credit": 0.540948275862069,
+          "tie_rate": 0.0,
+          "mean_score_margin": 0.016711051013834518,
+          "preference_log_loss": 0.6884817920741666,
+          "truncated_pair_rate": 0.0,
+          "num_pairs": 928,
+          "num_correct": 502,
+          "num_ties": 0,
+          "output_json": "/__modal/volumes/vo-dJb2XfIUQDx2Yey8FWnass/baseline_qwen3-1p7b/heldout/lr_5e-04_seed_1/eval_rm_reward_model_steals_test.json"
+        }
+      },
+      "error_type": null,
+      "error_message": null,
+      "traceback": null,
+      "wall_seconds": 178.8,
+      "reward_bench_2": {
+        "status": "succeeded",
+        "output_json": "/__modal/volumes/vo-dJb2XfIUQDx2Yey8FWnass/baseline_qwen3-1p7b/heldout/lr_5e-04_seed_1/eval_reward_bench_2.json",
+        "metrics_overall": {
+          "all_pairs_win_accuracy": 0.35677821894498013,
+          "pairwise_accuracy": 0.5753450557761391,
+          "mean_margin": 0.09617465439923974,
+          "n_examples": 1763,
+          "n_pairs": 5289,
+          "truncated_example_rate": 0.0
+        },
+        "metrics_per_subset": {
+          "Factuality": {
+            "all_pairs_win_accuracy": 0.3031578947368421,
+            "pairwise_accuracy": 0.536140350877193,
+            "mean_margin": 0.03993079533702449,
+            "n_examples": 475,
+            "n_pairs": 1425,
+            "truncated_example_rate": 0.0
+          },
+          "Precise IF": {
+            "all_pairs_win_accuracy": 0.2875,
+            "pairwise_accuracy": 0.4979166666666667,
+            "mean_margin": -0.032193443986276785,
+            "n_examples": 160,
+            "n_pairs": 480,
+            "truncated_example_rate": 0.0
+          },
+          "Math": {
+            "all_pairs_win_accuracy": 0.2677595628415301,
+            "pairwise_accuracy": 0.5245901639344263,
+            "mean_margin": 0.051355525851249695,
+            "n_examples": 183,
+            "n_pairs": 549,
+            "truncated_example_rate": 0.0
+          },
+          "Safety": {
+            "all_pairs_win_accuracy": 0.3288888888888889,
+            "pairwise_accuracy": 0.5444444444444444,
+            "mean_margin": 0.15421272640426953,
+            "n_examples": 450,
+            "n_pairs": 1350,
+            "truncated_example_rate": 0.0
+          },
+          "Focus": {
+            "all_pairs_win_accuracy": 0.4888888888888889,
+            "pairwise_accuracy": 0.6848484848484848,
+            "mean_margin": 0.15544636534520673,
+            "n_examples": 495,
+            "n_pairs": 1485,
+            "truncated_example_rate": 0.0
+          }
+        },
+        "ties_metrics": {
+          "n_examples": 102,
+          "n_ref_rows": 51,
+          "n_tied_rows": 51,
+          "n_shared_prompts": 51,
+          "n_shared_prompts_usable": 51,
+          "ref_accuracy": 0.0784313725490196,
+          "tied_accuracy": 0.058823529411764705,
+          "correctness_preferred": 0.0392156862745098,
+          "correctness_preferred_hard": 0.0,
+          "correctness_margin_score": -0.9814949296378133,
+          "overall_score": 0.03920465854675912,
+          "truncated_example_rate": 0.0
+        },
+        "combined_score": 0.2858999823171515,
+        "config": {
+          "max_length": 4096,
+          "batch_size": 16,
+          "torch_dtype": "float16",
+          "subsets_evaluated": [
+            "Factuality",
+            "Focus",
+            "Math",
+            "Precise IF",
+            "Safety",
+            "Ties"
+          ],
+          "skipped_ties": false,
+          "tie_epsilon": 1e-06,
+          "num_examples_capped": null
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,73 @@
+{
+  "base_model": "Qwen/Qwen3-1.7B",
+  "best_lr": 0.0005,
+  "validation": {
+    "lr": 0.0005,
+    "seed": 1,
+    "pairwise_accuracy": 1.0,
+    "pairwise_accuracy_ties_half_credit": 1.0,
+    "mean_score_margin": 7.352049739360809,
+    "tie_rate": 0.0,
+    "num_pairs": 200
+  },
+  "heldout_per_seed": {},
+  "heldout_aggregate": {
+    "reward_model_high_stakes_test": {
+      "n_seeds": 0,
+      "pairwise_accuracy": {
+        "mean": null,
+        "sd": null
+      },
+      "pairwise_accuracy_ties_half_credit": {
+        "mean": null,
+        "sd": null
+      },
+      "mean_score_margin": {
+        "mean": null,
+        "sd": null
+      },
+      "tie_rate": {
+        "mean": null,
+        "sd": null
+      }
+    },
+    "reward_model_astronomical_stakes_deployment": {
+      "n_seeds": 0,
+      "pairwise_accuracy": {
+        "mean": null,
+        "sd": null
+      },
+      "pairwise_accuracy_ties_half_credit": {
+        "mean": null,
+        "sd": null
+      },
+      "mean_score_margin": {
+        "mean": null,
+        "sd": null
+      },
+      "tie_rate": {
+        "mean": null,
+        "sd": null
+      }
+    },
+    "reward_model_steals_test": {
+      "n_seeds": 0,
+      "pairwise_accuracy": {
+        "mean": null,
+        "sd": null
+      },
+      "pairwise_accuracy_ties_half_credit": {
+        "mean": null,
+        "sd": null
+      },
+      "mean_score_margin": {
+        "mean": null,
+        "sd": null
+      },
+      "tie_rate": {
+        "mean": null,
+        "sd": null
+      }
+    }
+  }
+}

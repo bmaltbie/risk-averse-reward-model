@@ -1,0 +1,112 @@
+{
+  "base_model": "Qwen/Qwen3-8B",
+  "output_dir": "/__modal/volumes/vo-dJb2XfIUQDx2Yey8FWnass/lr_ablation_v2",
+  "started_at": "2026-04-26T13:40:53+00:00",
+  "updated_at": "2026-04-26T14:56:46+00:00",
+  "lr_ladder": [
+    1e-06,
+    5e-06,
+    1e-05,
+    5e-05,
+    0.0001,
+    0.0005,
+    0.001
+  ],
+  "middle_lr": 0.0001,
+  "candidate_lrs": [
+    5e-05,
+    0.0001,
+    0.0005
+  ],
+  "best_lr": 0.0005,
+  "counts": {
+    "planned": 3,
+    "succeeded": 3,
+    "failed": 0,
+    "pending": 0,
+    "running": 0
+  },
+  "runs": [
+    {
+      "phase": "validation",
+      "lr": 5e-05,
+      "seed": 1,
+      "run_dir": "validation/lr_5e-05_seed_1",
+      "status": "succeeded",
+      "training_wall_seconds": 1539.3,
+      "eval": {
+        "reward_model_validation": {
+          "status": "succeeded",
+          "pairwise_accuracy": 0.94,
+          "pairwise_accuracy_ties_half_credit": 0.94,
+          "tie_rate": 0.0,
+          "mean_score_margin": 4.453653333485127,
+          "preference_log_loss": 0.15394202044308528,
+          "truncated_pair_rate": 0.0,
+          "num_pairs": 200,
+          "num_correct": 188,
+          "num_ties": 0,
+          "output_json": "/__modal/volumes/vo-dJb2XfIUQDx2Yey8FWnass/lr_ablation_v2/validation/lr_5e-05_seed_1/eval_rm_reward_model_validation.json"
+        }
+      },
+      "error_type": null,
+      "error_message": null,
+      "traceback": null,
+      "wall_seconds": 1603.9
+    },
+    {
+      "phase": "validation",
+      "lr": 0.0001,
+      "seed": 1,
+      "run_dir": "validation/lr_1e-04_seed_1",
+      "status": "succeeded",
+      "training_wall_seconds": 1427.1,
+      "eval": {
+        "reward_model_validation": {
+          "status": "succeeded",
+          "pairwise_accuracy": 0.985,
+          "pairwise_accuracy_ties_half_credit": 0.985,
+          "tie_rate": 0.0,
+          "mean_score_margin": 9.514683155566454,
+          "preference_log_loss": 0.060518012004757156,
+          "truncated_pair_rate": 0.0,
+          "num_pairs": 200,
+          "num_correct": 197,
+          "num_ties": 0,
+          "output_json": "/__modal/volumes/vo-dJb2XfIUQDx2Yey8FWnass/lr_ablation_v2/validation/lr_1e-04_seed_1/eval_rm_reward_model_validation.json"
+        }
+      },
+      "error_type": null,
+      "error_message": null,
+      "traceback": null,
+      "wall_seconds": 1476.6
+    },
+    {
+      "phase": "validation",
+      "lr": 0.0005,
+      "seed": 1,
+      "run_dir": "validation/lr_5e-04_seed_1",
+      "status": "succeeded",
+      "training_wall_seconds": 1422.6,
+      "eval": {
+        "reward_model_validation": {
+          "status": "succeeded",
+          "pairwise_accuracy": 1.0,
+          "pairwise_accuracy_ties_half_credit": 1.0,
+          "tie_rate": 0.0,
+          "mean_score_margin": 5.630951206684113,
+          "preference_log_loss": 0.036418258197053924,
+          "truncated_pair_rate": 0.0,
+          "num_pairs": 200,
+          "num_correct": 200,
+          "num_ties": 0,
+          "output_json": "/__modal/volumes/vo-dJb2XfIUQDx2Yey8FWnass/lr_ablation_v2/validation/lr_5e-04_seed_1/eval_rm_reward_model_validation.json"
+        }
+      },
+      "error_type": null,
+      "error_message": null,
+      "traceback": null,
+      "wall_seconds": 1472.0
+    }
+  ]
+}
