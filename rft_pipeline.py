@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-rft_pipeline.py — Reward-Model Tuning checklist from Ben.pdf (items 1-14).
+rft_pipeline.py — Reward-model tuning pipeline.
 
 Two phases:
   1) Validation ladder: train at 2-3 LRs near --middle_lr (extended ladder
@@ -12,10 +12,9 @@ Two phases:
      `reward_model_steals_test`.
 
 Parameterized by --base_model so the same script runs Qwen3-1.7B / 8B / 14B
-(Ben.pdf items 13, 14). Architecture matches sweep.py / colab: AutoModel
-backbone (fp16) + LoRA (FEATURE_EXTRACTION) + separately trained
-nn.Linear(hidden, 1) reward head (fp32), saved as reward_head.pt alongside
-the LoRA adapter.
+and other supported backbones. Architecture: AutoModel backbone (fp16) +
+LoRA (FEATURE_EXTRACTION) + separately trained nn.Linear(hidden, 1) reward
+head (fp32), saved as reward_head.pt alongside the LoRA adapter.
 
 Per-run eval is delegated to the submodule's evaluate_reward_model.py.
 After train_one_run completes, run_single invokes that script via
@@ -77,33 +76,32 @@ DEFAULT_BASE_MODEL = "Qwen/Qwen3-8B"
 
 # --- LR ladder (not flag-overridable) ---
 # Fixed ladder of allowed learning-rate rungs. Any LR the pipeline uses
-# (middle_lr, best_lr) must snap to one of these. Ben.pdf line 628 prescribes
-# the first five; 5e-4 and 1e-3 are our extensions.
+# (middle_lr, best_lr) must snap to one of these.
 LR_LADDER: List[float] = [1e-6, 5e-6, 1e-5, 5e-5, 1e-4, 5e-4, 1e-3]
 
 # --- Starting / best LR (override: --middle_lr, --best_lr) ---
 DEFAULT_MIDDLE_LR: float = 1e-5
 
-# --- LoRA config (not flag-overridable; Ben.pdf line 632 locks these) ---
-# task_type is FEATURE_EXTRACTION to match sweep.py / colab architecture:
-# AutoModel backbone + separately trained nn.Linear(hidden, 1) reward head
-# (saved alongside the LoRA adapter as reward_head.pt).
+# --- LoRA config (not flag-overridable) ---
+# task_type is FEATURE_EXTRACTION because the architecture is an AutoModel
+# backbone + separately trained nn.Linear(hidden, 1) reward head (saved
+# alongside the LoRA adapter as reward_head.pt).
 LORA_R = 32
 LORA_ALPHA = 64
 LORA_DROPOUT = 0.05
 LORA_BIAS = "none"
 LORA_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 
-# --- Reward head init (not flag-overridable; matches sweep.py:91) ---
+# --- Reward head init (not flag-overridable) ---
 REWARD_HEAD_INIT_STD = 0.01
 
 # --- Training hyperparameters ---
 DEFAULT_EPOCHS = 5                  # override: --epochs               (ablation values: 3, 5, 7)
-DEFAULT_BATCH_SIZE = 2              # override: --batch_size           (Ben.pdf blank)
-DEFAULT_GRAD_ACCUM_STEPS = 32       # override: --grad_accum_steps     (Ben.pdf blank)
+DEFAULT_BATCH_SIZE = 2              # override: --batch_size
+DEFAULT_GRAD_ACCUM_STEPS = 32       # override: --grad_accum_steps
 DEFAULT_MAX_LENGTH = 1024           # override: --max_length
-DEFAULT_WEIGHT_DECAY = 0.05         # override: --weight_decay         (Ben.pdf blank; matches sweep.py)
-DEFAULT_WARMUP_RATIO = 0.1          # override: --warmup_ratio         (Ben.pdf line 661)
+DEFAULT_WEIGHT_DECAY = 0.05         # override: --weight_decay
+DEFAULT_WARMUP_RATIO = 0.1          # override: --warmup_ratio
 DEFAULT_MAX_GRAD_NORM = 1.0         # override: --max_grad_norm
 DEFAULT_TORCH_DTYPE = "float16"     # override: --torch_dtype (backbone only; head is fp32)
 DEFAULT_GRAD_CKPT = True            # override: --grad_ckpt / --no_grad_ckpt
@@ -143,17 +141,15 @@ DATASET_ALIAS_PATHS = {
 }
 
 # --- Seeds ---
-DEFAULT_SEEDS_VALIDATION = [1]              # override: --seeds_validation  (Ben.pdf line 58)
-DEFAULT_SEEDS_HELDOUT = [1, 2, 3]           # override: --seeds_heldout     (Ben.pdf line 62)
+DEFAULT_SEEDS_VALIDATION = [1]              # override: --seeds_validation
+DEFAULT_SEEDS_HELDOUT = [1, 2, 3]           # override: --seeds_heldout
 
 # --- System prompt ---
 # We do NOT use a system prompt during training or eval. Rationale:
-# (1) sweep.py and colab_notebook.ipynb also use no system prompt and produce
-#     our best measured results.
-# (2) Since option-2 in-process eval controls both train and eval formatting,
-#     there is no external parity to maintain with evaluate_reward_model.py.
-# (3) DEFAULT_SYSTEM_PROMPT was ~253 tokens; dropping it frees significant
-#     max_length budget for long CoT responses.
+# (1) In-process eval controls both train and eval formatting, so there
+#     is no external parity to maintain with evaluate_reward_model.py.
+# (2) Dropping the system prompt frees ~250 tokens of max_length budget
+#     for the long CoT responses.
 # Chat template still applies; it just collapses to [user, assistant] turns.
 
 # ============================================================
@@ -319,8 +315,8 @@ def select_candidate_lrs(middle_lr: float) -> List[float]:
     snapped = snap_to_ladder(middle_lr)
     if snapped is None:
         raise ValueError(
-            f"--middle_lr={middle_lr} is not on Ben.pdf ladder {LR_LADDER}. "
-            f"Off-ladder values require Elliott approval (Ben.pdf lines 628-636)."
+            f"--middle_lr={middle_lr} is not on the LR ladder {LR_LADDER}. "
+            f"Pass an on-ladder value or extend LR_LADDER."
         )
     i = LR_LADDER.index(snapped)
     rungs: List[float] = []
@@ -444,7 +440,7 @@ def train_one_run(
     tokenizer.padding_side = "right"
 
     dtype = parse_torch_dtype_name(args.torch_dtype)
-    # FEATURE_EXTRACTION architecture (matches sweep.py:603-675):
+    # FEATURE_EXTRACTION architecture:
     # - AutoModel backbone in fp16 for memory efficiency
     # - Separate nn.Linear(hidden, 1) reward head in fp32 for numerical stability
     # - Hidden states cast fp16 -> fp32 before the head (no .detach(), so
@@ -1368,12 +1364,12 @@ def parse_args() -> argparse.Namespace:
     args = p.parse_args()
 
     if snap_to_ladder(args.middle_lr) is None:
-        p.error(f"--middle_lr={args.middle_lr} not in ladder {LR_LADDER} (Ben.pdf 628-636).")
+        p.error(f"--middle_lr={args.middle_lr} not in ladder {LR_LADDER}.")
     if args.skip_validation:
         if args.best_lr is None:
             p.error("--skip_validation requires --best_lr")
         if snap_to_ladder(args.best_lr) is None:
-            p.error(f"--best_lr={args.best_lr} not in ladder {LR_LADDER} (Ben.pdf 628-636).")
+            p.error(f"--best_lr={args.best_lr} not in ladder {LR_LADDER}.")
 
     if args.output_dir is None:
         tag = args.base_model.replace("/", "_").replace(":", "_")
@@ -1608,7 +1604,7 @@ def main() -> int:
     elif not args.single_lr and len(candidate_lrs) < 3:
         print(
             f"[main] WARNING: middle_lr={args.middle_lr} is at the ladder edge; only {len(candidate_lrs)} "
-            f"rungs will be tested ({candidate_lrs}). Consider messaging Elliott (Ben.pdf line 656)."
+            f"rungs will be tested ({candidate_lrs})."
         )
 
     atomic_write_json(
