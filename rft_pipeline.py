@@ -538,42 +538,53 @@ def train_one_run(
             ckpt_dir / "reward_head.pt",
         )
 
-    for epoch in range(args.epochs):
-        backbone.train()
-        reward_head.train()
-        epoch_loss_sum = 0.0
-        epoch_loss_n = 0
-        optim.zero_grad()
-        for step, batch in enumerate(loader):
-            try:
-                chosen = {k: v.to(device, non_blocking=True) for k, v in batch["chosen"].items()}
-                rejected = {k: v.to(device, non_blocking=True) for k, v in batch["rejected"].items()}
-                r_c = compute_rewards(chosen["input_ids"], chosen["attention_mask"])
-                r_r = compute_rewards(rejected["input_ids"], rejected["attention_mask"])
-                loss = -F.logsigmoid(r_c - r_r).mean()
-                (loss / args.grad_accum_steps).backward()
-                epoch_loss_sum += loss.item() * r_c.shape[0]
-                epoch_loss_n += r_c.shape[0]
-                if (step + 1) % args.grad_accum_steps == 0 or (step + 1) == steps_per_epoch:
-                    torch.nn.utils.clip_grad_norm_(trainable, args.max_grad_norm)
-                    optim.step()
-                    scheduler.step()
-                    optim.zero_grad()
-            except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
-                msg = str(e).lower()
-                if "out of memory" in msg or isinstance(e, torch.cuda.OutOfMemoryError):
-                    print(f"[train] WARNING: CUDA OOM at epoch {epoch+1} step {step+1}. Aborting run.")
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    raise OOMSkipRun(f"OOM at epoch {epoch+1} step {step+1}") from e
-                raise
+    # --no_train baseline: evaluate freshly-init'd model with no training. We
+    # still run the per-epoch eval pass below to produce eval_reward_model_validation.json
+    # and save the checkpoint, but skip the inner training loop entirely.
+    n_epochs = 1 if getattr(args, "no_train", False) else args.epochs
 
-        avg_loss = epoch_loss_sum / max(epoch_loss_n, 1)
+    for epoch in range(n_epochs):
+        if not getattr(args, "no_train", False):
+            backbone.train()
+            reward_head.train()
+            epoch_loss_sum = 0.0
+            epoch_loss_n = 0
+            optim.zero_grad()
+            for step, batch in enumerate(loader):
+                try:
+                    chosen = {k: v.to(device, non_blocking=True) for k, v in batch["chosen"].items()}
+                    rejected = {k: v.to(device, non_blocking=True) for k, v in batch["rejected"].items()}
+                    r_c = compute_rewards(chosen["input_ids"], chosen["attention_mask"])
+                    r_r = compute_rewards(rejected["input_ids"], rejected["attention_mask"])
+                    loss = -F.logsigmoid(r_c - r_r).mean()
+                    (loss / args.grad_accum_steps).backward()
+                    epoch_loss_sum += loss.item() * r_c.shape[0]
+                    epoch_loss_n += r_c.shape[0]
+                    if (step + 1) % args.grad_accum_steps == 0 or (step + 1) == steps_per_epoch:
+                        torch.nn.utils.clip_grad_norm_(trainable, args.max_grad_norm)
+                        optim.step()
+                        scheduler.step()
+                        optim.zero_grad()
+                except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
+                    msg = str(e).lower()
+                    if "out of memory" in msg or isinstance(e, torch.cuda.OutOfMemoryError):
+                        print(f"[train] WARNING: CUDA OOM at epoch {epoch+1} step {step+1}. Aborting run.")
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        raise OOMSkipRun(f"OOM at epoch {epoch+1} step {step+1}") from e
+                    raise
+            avg_loss = epoch_loss_sum / max(epoch_loss_n, 1)
+            current_lr = scheduler.get_last_lr()[0]
+        else:
+            avg_loss = None
+            current_lr = 0.0
+
         entry: Dict[str, Any] = {
             "epoch": epoch + 1,
             "train_loss": avg_loss,
-            "lr": scheduler.get_last_lr()[0],
+            "lr": current_lr,
             "wall_seconds": round(time.time() - start, 1),
+            "no_train_baseline": bool(getattr(args, "no_train", False)),
         }
 
         # --- per-epoch validation on reward_model_validation ---
@@ -602,7 +613,8 @@ def train_one_run(
 
         improved = val_acc > best_val_acc
         marker = " * NEW BEST" if improved else ""
-        print(f"[train] epoch {epoch+1}/{args.epochs} train_loss={avg_loss:.4f} "
+        loss_str = f"{avg_loss:.4f}" if avg_loss is not None else "(no_train)"
+        print(f"[train] epoch {epoch+1}/{n_epochs} train_loss={loss_str} "
               f"val_acc={val_acc:.4f}{marker}")
 
         if improved:
@@ -1348,6 +1360,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--trust_remote_code", action="store_true")
     p.add_argument("--grad_ckpt", dest="grad_ckpt", action="store_true", default=DEFAULT_GRAD_CKPT)
     p.add_argument("--no_grad_ckpt", dest="grad_ckpt", action="store_false")
+    p.add_argument("--no_train", action="store_true",
+                   help="Skip training entirely. Initialize model + LoRA + reward head, "
+                        "save the random-init checkpoint, and run all evals against it. "
+                        "Use for untrained-baseline measurements.")
     p.add_argument("--dry_run", action="store_true")
     args = p.parse_args()
 
@@ -1375,6 +1391,8 @@ def write_final_summary(args: argparse.Namespace, status: Dict[str, Any]) -> Non
         "base_model": args.base_model,
         "best_lr": best_lr,
         "validation": None,
+        "validation_per_seed": {},
+        "validation_aggregate": {},
         "heldout_per_seed": {},
         "heldout_aggregate": {},
         "reward_bench_2_per_seed": {},
@@ -1396,6 +1414,50 @@ def write_final_summary(args: argparse.Namespace, status: Dict[str, Any]) -> Non
             }
         except KeyError:
             pass
+
+        # Per-seed validation block + aggregate (mean ± SD across seeds_validation).
+        # Mirrors the heldout_per_seed / heldout_aggregate shape so users running
+        # the validation phase for multiple seeds can compute SD on validation pairwise
+        # accuracy. Single-seed runs land here too (sd=None).
+        val_per_seed: Dict[str, Dict[str, Any]] = {}
+        for seed in args.seeds_validation:
+            try:
+                entry = find_run(status, RunKey("validation", best_lr, seed))
+            except KeyError:
+                continue
+            if entry["status"] != "succeeded":
+                continue
+            ev = entry["eval"].get("reward_model_validation", {}) or {}
+            if not ev:
+                continue
+            val_per_seed[str(seed)] = {
+                "pairwise_accuracy": ev.get("pairwise_accuracy"),
+                "pairwise_accuracy_ties_half_credit": ev.get("pairwise_accuracy_ties_half_credit"),
+                "mean_score_margin": ev.get("mean_score_margin"),
+                "tie_rate": ev.get("tie_rate"),
+                "num_pairs": ev.get("num_pairs"),
+                "output_json": ev.get("output_json"),
+            }
+        summary["validation_per_seed"] = val_per_seed
+
+        if val_per_seed:
+            VAL_METRICS = ("pairwise_accuracy", "pairwise_accuracy_ties_half_credit",
+                           "mean_score_margin", "tie_rate")
+            by_metric: Dict[str, List[float]] = {m: [] for m in VAL_METRICS}
+            for seed_data in val_per_seed.values():
+                for m in VAL_METRICS:
+                    v = seed_data.get(m)
+                    if v is not None:
+                        by_metric[m].append(float(v))
+            val_agg: Dict[str, Any] = {"n_seeds": len(val_per_seed)}
+            for m, vals in by_metric.items():
+                if not vals:
+                    val_agg[m] = {"mean": None, "sd": None}
+                elif len(vals) == 1:
+                    val_agg[m] = {"mean": vals[0], "sd": None}
+                else:
+                    val_agg[m] = {"mean": float(np.mean(vals)), "sd": float(np.std(vals, ddof=1))}
+            summary["validation_aggregate"] = val_agg
 
         per_seed: Dict[str, Dict[str, Any]] = {}
         for seed in args.seeds_heldout:
